@@ -1,6 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import init, { greet, fibonacci, is_prime } from './wasm-pkg/ergot_demo_wasm'
+import { ref, onMounted, onUnmounted } from 'vue'
+import init, {
+  greet,
+  fibonacci,
+  check_prime,
+  start_prime_search,
+  type BackgroundTask,
+} from './wasm-pkg/ergot_demo_wasm'
 
 const wasmReady = ref(false)
 const greetName = ref('World')
@@ -10,9 +16,20 @@ const fibResult = ref('')
 const primeN = ref(97)
 const primeResult = ref('')
 
+// Background task state
+let task: BackgroundTask | null = null
+const taskRunning = ref(false)
+const checked = ref(0)
+const primesFound = ref(0)
+const lastPrime = ref(0)
+
 onMounted(async () => {
   await init()
   wasmReady.value = true
+})
+
+onUnmounted(() => {
+  stopSearch()
 })
 
 function runGreet() {
@@ -25,8 +42,29 @@ function runFibonacci() {
 }
 
 function runIsPrime() {
-  const result = is_prime(BigInt(primeN.value))
+  const result = check_prime(BigInt(primeN.value))
   primeResult.value = `${primeN.value} is ${result ? '' : 'not '}prime`
+}
+
+function startSearch() {
+  if (task) return
+  checked.value = 0
+  primesFound.value = 0
+  lastPrime.value = 0
+  task = start_prime_search((c: number, f: number, lp: number) => {
+    checked.value = c
+    primesFound.value = f
+    lastPrime.value = lp
+  })
+  taskRunning.value = true
+}
+
+function stopSearch() {
+  if (!task) return
+  task.stop()
+  task.free()
+  task = null
+  taskRunning.value = false
 }
 </script>
 
@@ -64,6 +102,32 @@ function runIsPrime() {
         </div>
         <p v-if="primeResult" class="result">{{ primeResult }}</p>
       </section>
+
+      <section>
+        <h2>Background prime search</h2>
+        <p class="description">
+          Spawns an async Rust task (via tokio_with_wasm) that searches for
+          primes and reports progress back to Vue.
+        </p>
+        <div class="row">
+          <button v-if="!taskRunning" @click="startSearch">Start</button>
+          <button v-else class="stop" @click="stopSearch">Stop</button>
+        </div>
+        <div v-if="checked > 0" class="stats">
+          <div class="stat">
+            <span class="stat-label">Checked</span>
+            <span class="stat-value">{{ checked.toLocaleString() }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Primes found</span>
+            <span class="stat-value">{{ primesFound.toLocaleString() }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Latest prime</span>
+            <span class="stat-value">{{ lastPrime.toLocaleString() }}</span>
+          </div>
+        </div>
+      </section>
     </template>
   </div>
 </template>
@@ -83,6 +147,12 @@ function runIsPrime() {
 .loading {
   color: #999;
   font-style: italic;
+}
+
+.description {
+  color: #666;
+  font-size: 0.9rem;
+  margin-top: -0.25rem;
 }
 
 section {
@@ -123,11 +193,47 @@ button:hover {
   background: #38a373;
 }
 
+button.stop {
+  background: #e74c3c;
+}
+
+button.stop:hover {
+  background: #c0392b;
+}
+
 .result {
   margin-top: 0.75rem;
   padding: 0.5rem;
   background: #f5f5f5;
   border-radius: 4px;
   font-family: monospace;
+}
+
+.stats {
+  margin-top: 0.75rem;
+  display: flex;
+  gap: 1rem;
+}
+
+.stat {
+  flex: 1;
+  padding: 0.5rem;
+  background: #f5f5f5;
+  border-radius: 4px;
+  text-align: center;
+}
+
+.stat-label {
+  display: block;
+  font-size: 0.75rem;
+  color: #888;
+  margin-bottom: 0.25rem;
+}
+
+.stat-value {
+  display: block;
+  font-family: monospace;
+  font-size: 1.1rem;
+  font-weight: 600;
 }
 </style>
