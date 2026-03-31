@@ -1,239 +1,141 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
-import init, {
-  greet,
-  fibonacci,
-  check_prime,
-  start_prime_search,
-  type BackgroundTask,
-} from './wasm-pkg/ergot_demo_wasm'
+import { ref } from 'vue'
+import { VueFlow, useVueFlow } from '@vue-flow/core'
+import type { Node, Edge, Connection } from '@vue-flow/core'
 
-const wasmReady = ref(false)
-const greetName = ref('World')
-const greetResult = ref('')
-const fibN = ref(10)
-const fibResult = ref('')
-const primeN = ref(97)
-const primeResult = ref('')
+let nextId = 4
 
-// Background task state
-let task: BackgroundTask | null = null
-const taskRunning = ref(false)
-const checked = ref(0)
-const primesFound = ref(0)
-const lastPrime = ref(0)
+const nodes = ref<Node[]>([
+  {
+    id: '1',
+    type: 'default',
+    label: 'Router A',
+    position: { x: 250, y: 50 },
+  },
+  {
+    id: '2',
+    type: 'default',
+    label: 'Edge B',
+    position: { x: 100, y: 250 },
+  },
+  {
+    id: '3',
+    type: 'default',
+    label: 'Edge C',
+    position: { x: 400, y: 250 },
+  },
+])
 
-onMounted(async () => {
-  await init()
-  wasmReady.value = true
-})
+const edges = ref<Edge[]>([
+  { id: 'e1-2', source: '1', target: '2' },
+  { id: 'e1-3', source: '1', target: '3' },
+])
 
-onUnmounted(() => {
-  stopSearch()
-})
+const { fitView, project, getSelectedNodes, getSelectedEdges, removeNodes, removeEdges } = useVueFlow()
 
-function runGreet() {
-  greetResult.value = greet(greetName.value)
-}
-
-function runFibonacci() {
-  const result = fibonacci(fibN.value)
-  fibResult.value = `fibonacci(${fibN.value}) = ${result}`
-}
-
-function runIsPrime() {
-  const result = check_prime(BigInt(primeN.value))
-  primeResult.value = `${primeN.value} is ${result ? '' : 'not '}prime`
-}
-
-function startSearch() {
-  if (task) return
-  checked.value = 0
-  primesFound.value = 0
-  lastPrime.value = 0
-  task = start_prime_search((c: number, f: number, lp: number) => {
-    checked.value = c
-    primesFound.value = f
-    lastPrime.value = lp
+function addNode() {
+  const id = String(nextId++)
+  nodes.value.push({
+    id,
+    type: 'default',
+    label: `Node ${id}`,
+    position: project({ x: 300, y: 200 }),
   })
-  taskRunning.value = true
 }
 
-function stopSearch() {
-  if (!task) return
-  task.stop()
-  task.free()
-  task = null
-  taskRunning.value = false
+function onConnect(connection: Connection) {
+  edges.value.push({
+    id: `e${connection.source}-${connection.target}`,
+    source: connection.source,
+    target: connection.target,
+  })
+}
+
+function deleteSelected() {
+  const selectedNodes = getSelectedNodes.value
+  const selectedEdges = getSelectedEdges.value
+  if (selectedNodes.length) removeNodes(selectedNodes)
+  if (selectedEdges.length) removeEdges(selectedEdges)
+}
+
+function onKeyDown(e: KeyboardEvent) {
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    deleteSelected()
+  }
 }
 </script>
 
 <template>
-  <div class="container">
-    <h1>Ergot Demo</h1>
-    <p class="subtitle">Rust WASM + Vue</p>
-
-    <div v-if="!wasmReady" class="loading">Loading WASM module...</div>
-
-    <template v-else>
-      <section>
-        <h2>Greet</h2>
-        <div class="row">
-          <input v-model="greetName" placeholder="Enter a name" @keyup.enter="runGreet" />
-          <button @click="runGreet">Greet</button>
+  <UApp>
+    <div class="h-screen flex flex-col" @keydown="onKeyDown" tabindex="0">
+      <header class="flex items-center justify-between px-4 py-2 border-b border-(--ui-border-muted) bg-(--ui-bg-elevated)">
+        <h1 class="text-lg font-semibold text-(--ui-text-highlighted)">Ergot Network Topology</h1>
+        <div class="flex gap-2">
+          <UButton icon="i-lucide-plus" @click="addNode">Add Node</UButton>
+          <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected">Delete Selected</UButton>
+          <UColorModeButton />
         </div>
-        <p v-if="greetResult" class="result">{{ greetResult }}</p>
-      </section>
-
-      <section>
-        <h2>Fibonacci</h2>
-        <div class="row">
-          <input v-model.number="fibN" type="number" min="0" max="93" @keyup.enter="runFibonacci" />
-          <button @click="runFibonacci">Compute</button>
-        </div>
-        <p v-if="fibResult" class="result">{{ fibResult }}</p>
-      </section>
-
-      <section>
-        <h2>Prime check</h2>
-        <div class="row">
-          <input v-model.number="primeN" type="number" min="0" @keyup.enter="runIsPrime" />
-          <button @click="runIsPrime">Check</button>
-        </div>
-        <p v-if="primeResult" class="result">{{ primeResult }}</p>
-      </section>
-
-      <section>
-        <h2>Background prime search</h2>
-        <p class="description">
-          Spawns an async Rust task (via tokio_with_wasm) that searches for
-          primes and reports progress back to Vue.
-        </p>
-        <div class="row">
-          <button v-if="!taskRunning" @click="startSearch">Start</button>
-          <button v-else class="stop" @click="stopSearch">Stop</button>
-        </div>
-        <div v-if="checked > 0" class="stats">
-          <div class="stat">
-            <span class="stat-label">Checked</span>
-            <span class="stat-value">{{ checked.toLocaleString() }}</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Primes found</span>
-            <span class="stat-value">{{ primesFound.toLocaleString() }}</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Latest prime</span>
-            <span class="stat-value">{{ lastPrime.toLocaleString() }}</span>
-          </div>
-        </div>
-      </section>
-    </template>
-  </div>
+      </header>
+      <div class="flex-1">
+        <VueFlow
+          :nodes="nodes"
+          :edges="edges"
+          :default-viewport="{ zoom: 1 }"
+          :min-zoom="0.2"
+          :max-zoom="4"
+          fit-view-on-init
+          @nodes-initialized="fitView"
+          @connect="onConnect"
+        />
+      </div>
+    </div>
+  </UApp>
 </template>
 
-<style scoped>
-.container {
-  max-width: 600px;
-  margin: 2rem auto;
-  font-family: system-ui, sans-serif;
+<style>
+@import '@vue-flow/core/dist/style.css';
+
+.vue-flow {
+  background: var(--ui-bg-default);
 }
 
-.subtitle {
-  color: #888;
-  margin-top: -0.5rem;
+.vue-flow__node-default {
+  background: var(--ui-bg-accented);
+  color: var(--ui-text-highlighted);
+  border: 1px solid var(--ui-border-default);
+  border-radius: var(--ui-radius);
+  padding: 10px 16px;
+  font-size: 0.875rem;
+  box-shadow: var(--tw-shadow, 0 1px 2px rgb(0 0 0 / 0.05));
 }
 
-.loading {
-  color: #999;
-  font-style: italic;
+.vue-flow__node-default.selected {
+  border-color: var(--ui-primary);
+  box-shadow: 0 0 0 2px var(--ui-primary);
 }
 
-.description {
-  color: #666;
-  font-size: 0.9rem;
-  margin-top: -0.25rem;
+.vue-flow__edge-path {
+  stroke: var(--ui-border-accented);
+  stroke-width: 2;
 }
 
-section {
-  margin: 1.5rem 0;
-  padding: 1rem;
-  border: 1px solid #ddd;
-  border-radius: 8px;
+.vue-flow__edge.selected .vue-flow__edge-path {
+  stroke: var(--ui-primary);
 }
 
-h2 {
-  margin-top: 0;
+.vue-flow__handle {
+  width: 8px;
+  height: 8px;
+  background: var(--ui-border-accented);
+  border: 2px solid var(--ui-bg-elevated);
 }
 
-.row {
-  display: flex;
-  gap: 0.5rem;
+.vue-flow__handle:hover {
+  background: var(--ui-primary);
 }
 
-input {
-  flex: 1;
-  padding: 0.5rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  font-size: 1rem;
-}
-
-button {
-  padding: 0.5rem 1rem;
-  background: #42b883;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 1rem;
-}
-
-button:hover {
-  background: #38a373;
-}
-
-button.stop {
-  background: #e74c3c;
-}
-
-button.stop:hover {
-  background: #c0392b;
-}
-
-.result {
-  margin-top: 0.75rem;
-  padding: 0.5rem;
-  background: #f5f5f5;
-  border-radius: 4px;
-  font-family: monospace;
-}
-
-.stats {
-  margin-top: 0.75rem;
-  display: flex;
-  gap: 1rem;
-}
-
-.stat {
-  flex: 1;
-  padding: 0.5rem;
-  background: #f5f5f5;
-  border-radius: 4px;
-  text-align: center;
-}
-
-.stat-label {
-  display: block;
-  font-size: 0.75rem;
-  color: #888;
-  margin-bottom: 0.25rem;
-}
-
-.stat-value {
-  display: block;
-  font-family: monospace;
-  font-size: 1.1rem;
-  font-weight: 600;
+.vue-flow__connection-line path {
+  stroke: var(--ui-primary);
+  stroke-width: 2;
 }
 </style>
