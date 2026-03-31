@@ -1,53 +1,59 @@
 <script setup lang="ts">
-import { ref } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Node, Edge, Connection } from '@vue-flow/core'
+import ErgotNode from './components/ErgotNode.vue'
+import type { ProfileType } from './components/ErgotNode.vue'
 
 let nextId = 4
 
-const nodes = ref<Node[]>([
+const initialNodes: Node[] = [
   {
     id: '1',
-    type: 'default',
-    label: 'Router A',
+    type: 'ergot',
     position: { x: 250, y: 50 },
+    data: { label: 'Router A', profile: 'root-router' as ProfileType },
   },
   {
     id: '2',
-    type: 'default',
-    label: 'Edge B',
+    type: 'ergot',
     position: { x: 100, y: 250 },
+    data: { label: 'Node B', profile: 'edge' as ProfileType },
   },
   {
     id: '3',
-    type: 'default',
-    label: 'Edge C',
+    type: 'ergot',
     position: { x: 400, y: 250 },
+    data: { label: 'Node C', profile: 'edge' as ProfileType },
   },
-])
+]
 
-const edges = ref<Edge[]>([
-  { id: 'e1-2', source: '1', target: '2' },
-  { id: 'e1-3', source: '1', target: '3' },
-])
+const initialEdges: Edge[] = [
+  { id: 'e1-2', source: '1', sourceHandle: 'bottom', target: '2', targetHandle: 'top' },
+  { id: 'e1-3', source: '1', sourceHandle: 'bottom', target: '3', targetHandle: 'top' },
+]
 
-const { fitView, project, getSelectedNodes, getSelectedEdges, removeNodes, removeEdges } = useVueFlow()
+const { fitView, project, addNodes, addEdges, getSelectedNodes, getSelectedEdges, removeNodes, removeEdges } = useVueFlow({
+  nodes: initialNodes,
+  edges: initialEdges,
+})
 
 function addNode() {
   const id = String(nextId++)
-  nodes.value.push({
+  addNodes({
     id,
-    type: 'default',
-    label: `Node ${id}`,
+    type: 'ergot',
     position: project({ x: 300, y: 200 }),
+    data: { label: `Node ${id}`, profile: 'edge' as ProfileType },
   })
 }
 
 function onConnect(connection: Connection) {
-  edges.value.push({
+  addEdges({
     id: `e${connection.source}-${connection.target}`,
     source: connection.source,
+    sourceHandle: connection.sourceHandle,
     target: connection.target,
+    targetHandle: connection.targetHandle,
   })
 }
 
@@ -78,15 +84,17 @@ function onKeyDown(e: KeyboardEvent) {
       </header>
       <div class="flex-1">
         <VueFlow
-          :nodes="nodes"
-          :edges="edges"
           :default-viewport="{ zoom: 1 }"
           :min-zoom="0.2"
           :max-zoom="4"
           fit-view-on-init
           @nodes-initialized="fitView"
           @connect="onConnect"
-        />
+        >
+          <template #node-ergot="nodeProps">
+            <ErgotNode :data="nodeProps.data" />
+          </template>
+        </VueFlow>
       </div>
     </div>
   </UApp>
@@ -99,17 +107,17 @@ function onKeyDown(e: KeyboardEvent) {
   background: var(--ui-bg-default);
 }
 
-.vue-flow__node-default {
+.vue-flow__node-ergot {
   background: var(--ui-bg-accented);
   color: var(--ui-text-highlighted);
   border: 1px solid var(--ui-border-default);
   border-radius: var(--ui-radius);
-  padding: 10px 16px;
-  font-size: 0.875rem;
+  padding: 0;
+  font-size: 0.75rem;
   box-shadow: var(--tw-shadow, 0 1px 2px rgb(0 0 0 / 0.05));
 }
 
-.vue-flow__node-default.selected {
+.vue-flow__node-ergot.selected {
   border-color: var(--ui-primary);
   box-shadow: 0 0 0 2px var(--ui-primary);
 }
