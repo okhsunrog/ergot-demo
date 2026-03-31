@@ -217,6 +217,7 @@ dependencies = [
  "critical-section",
  "embassy-futures",
  "embassy-time",
+ "futures-io",
  "heapless 0.9.2",
  "log",
  "maitake-sync",
@@ -253,6 +254,12 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
 name = "futures-task"
