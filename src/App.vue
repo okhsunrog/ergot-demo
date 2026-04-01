@@ -1,6 +1,8 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Node, Edge, Connection } from '@vue-flow/core'
+import init, { ergot_ping_test } from './wasm-pkg/ergot_demo_wasm'
 import ErgotNode from './components/ErgotNode.vue'
 import type { ProfileType } from './components/ErgotNode.vue'
 
@@ -69,6 +71,16 @@ function onKeyDown(e: KeyboardEvent) {
     deleteSelected()
   }
 }
+
+const wasmReady = ref(false)
+const pingResult = ref('')
+
+init().then(() => { wasmReady.value = true })
+
+async function runPingTest() {
+  pingResult.value = 'Pinging...'
+  pingResult.value = await ergot_ping_test()
+}
 </script>
 
 <template>
@@ -79,6 +91,8 @@ function onKeyDown(e: KeyboardEvent) {
         <div class="flex gap-2">
           <UButton icon="i-lucide-plus" @click="addNode">Add Node</UButton>
           <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected">Delete Selected</UButton>
+          <UButton v-if="wasmReady" variant="outline" @click="runPingTest">Ping Test</UButton>
+          <span v-if="pingResult" class="text-xs text-(--ui-text-muted) self-center">{{ pingResult }}</span>
           <UColorModeButton />
         </div>
       </header>
