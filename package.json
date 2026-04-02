@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "wasm:build": "wasm-pack build wasm --target web --out-dir ../src/wasm-pkg",
     "dev": "vp run wasm:build && vp dev",
     "build": "vp run wasm:build && vp exec vue-tsc --build && vp build",
     "preview": "vp preview",
