@@ -6,7 +6,7 @@ Vue 3.6 (beta) + Nuxt UI v4 + Pinia + Vue Router + Vue Flow project with a Rust/
 
 - **WASM build**: Defined as a Vite Task with caching in `vite.config.ts`. `vp run wasm:build` skips if nothing in `wasm/src/` or `wasm/Cargo.toml` changed. `wasm-pack` is a system binary (cargo-installed), not an npm package.
 - **WASM hot reload**: A custom Vite plugin (`wasmHotRebuild`) watches `.rs` files, `Cargo.toml`, and `Cargo.lock` in `wasm/` and triggers wasm-pack rebuild before HMR.
-- **Type checking**: Use `vue-tsc --build`, not `tsc`. tsgolint's `typeCheck` doesn't support `.vue` SFC imports yet. The lint config uses `typeAware: true` only (no `typeCheck`).
+- **Type checking**: Use `vue-tsc --build`, not `tsc`. tsgolint's `typeCheck` doesn't support `.vue` SFC imports yet. The lint config uses `typeAware: true` only (no `typeCheck`). Type checking runs in the pre-commit hook (`.vite-hooks/pre-commit` runs `vp staged` then `vp exec vue-tsc --build`) and is available manually via `vp run typecheck`.
 - **Scripts**: `vp run dev` (cached wasm build + dev server), `vp run build` (cached wasm build + vue-tsc + vite build). Use `vp run`, not `bun run`.
 - **Vue beta overrides**: `package.json` has overrides pinning all `@vue/*` packages to `beta` channel.
 

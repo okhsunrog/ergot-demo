@@ -55,6 +55,9 @@ export default defineConfig({
   },
   run: {
     tasks: {
+      typecheck: {
+        command: 'vp exec vue-tsc --build',
+      },
       'wasm:build': {
         command: 'wasm-pack build wasm --target web --out-dir ../src/wasm-pkg',
         cache: true,
