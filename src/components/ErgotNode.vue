@@ -19,7 +19,7 @@ const profileOptions = [
 const profileColors: Record<ProfileType, string> = {
   'root-router': 'var(--ui-warning)',
   'bridge-router': 'var(--ui-info)',
-  'edge': 'var(--ui-success)',
+  edge: 'var(--ui-success)',
 }
 
 function onProfileChange(value: string) {
@@ -30,12 +30,7 @@ function onProfileChange(value: string) {
 <template>
   <div class="ergot-node">
     <!-- Upstream handle -->
-    <Handle
-      v-if="data.profile !== 'root-router'"
-      id="top"
-      type="target"
-      :position="Position.Top"
-    />
+    <Handle v-if="data.profile !== 'root-router'" id="top" type="target" :position="Position.Top" />
 
     <div class="flex items-center gap-1 mb-0.5">
       <span
@@ -56,12 +51,7 @@ function onProfileChange(value: string) {
     />
 
     <!-- Downstream handle -->
-    <Handle
-      v-if="data.profile !== 'edge'"
-      id="bottom"
-      type="source"
-      :position="Position.Bottom"
-    />
+    <Handle v-if="data.profile !== 'edge'" id="bottom" type="source" :position="Position.Bottom" />
   </div>
 </template>
 

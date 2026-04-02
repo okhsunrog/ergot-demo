@@ -34,7 +34,16 @@ const initialEdges: Edge[] = [
   { id: 'e1-3', source: '1', sourceHandle: 'bottom', target: '3', targetHandle: 'top' },
 ]
 
-const { fitView, project, addNodes, addEdges, getSelectedNodes, getSelectedEdges, removeNodes, removeEdges } = useVueFlow({
+const {
+  fitView,
+  project,
+  addNodes,
+  addEdges,
+  getSelectedNodes,
+  getSelectedEdges,
+  removeNodes,
+  removeEdges,
+} = useVueFlow({
   nodes: initialNodes,
   edges: initialEdges,
 })
@@ -75,7 +84,9 @@ function onKeyDown(e: KeyboardEvent) {
 const wasmReady = ref(false)
 const pingResult = ref('')
 
-init().then(() => { wasmReady.value = true })
+init().then(() => {
+  wasmReady.value = true
+})
 
 async function runPingTest() {
   pingResult.value = 'Pinging...'
@@ -86,13 +97,19 @@ async function runPingTest() {
 <template>
   <UApp>
     <div class="h-screen flex flex-col" @keydown="onKeyDown" tabindex="0">
-      <header class="flex items-center justify-between px-4 py-2 border-b border-(--ui-border-muted) bg-(--ui-bg-elevated)">
+      <header
+        class="flex items-center justify-between px-4 py-2 border-b border-(--ui-border-muted) bg-(--ui-bg-elevated)"
+      >
         <h1 class="text-lg font-semibold text-(--ui-text-highlighted)">Ergot Network Topology</h1>
         <div class="flex gap-2">
           <UButton icon="i-lucide-plus" @click="addNode">Add Node</UButton>
-          <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected">Delete Selected</UButton>
+          <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected"
+            >Delete Selected</UButton
+          >
           <UButton v-if="wasmReady" variant="outline" @click="runPingTest">Ping Test</UButton>
-          <span v-if="pingResult" class="text-xs text-(--ui-text-muted) self-center">{{ pingResult }}</span>
+          <span v-if="pingResult" class="text-xs text-(--ui-text-muted) self-center">{{
+            pingResult
+          }}</span>
           <UColorModeButton />
         </div>
       </header>

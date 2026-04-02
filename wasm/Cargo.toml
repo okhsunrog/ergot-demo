@@ -8,7 +8,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_log = "1.0.0"
-ergot = { path = "../../../rust/ergot/crates/ergot", default-features = false, features = ["std", "futures-io"] }
+ergot = { path = "../../../rust/ergot/crates/ergot", default-features = false, features = [
+  "std",
+  "futures-io",
+] }
 futures-io = "0.3.32"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3.92"
