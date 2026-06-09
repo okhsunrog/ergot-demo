@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Connection } from '@vue-flow/core'
 import ErgotNode from './components/ErgotNode.vue'
-import { useTopologyStore, type ProfileType } from '@/stores/topology'
+import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
 
 const store = useTopologyStore()
 const toast = useToast()
@@ -24,14 +24,18 @@ let nodeSeq = 0
 const newNodeId = () => `n-${crypto.randomUUID()}`
 const newEdgeId = () => `e-${crypto.randomUUID()}`
 
-function addNode(profile: ProfileType, position?: { x: number; y: number }) {
+function addNode(
+  profile: ProfileType,
+  position?: { x: number; y: number },
+  kind: LinkKindType = 'stream',
+) {
   const id = newNodeId()
-  store.createNode(id, profile)
+  store.createNode(id, profile, kind)
   addNodes({
     id,
     type: 'ergot',
     position: position ?? project({ x: 250 + Math.random() * 100, y: 150 + Math.random() * 100 }),
-    data: { label: `${profile === 'router' ? 'Router' : 'Node'} ${++nodeSeq}`, profile },
+    data: { label: `${profile === 'router' ? 'Router' : 'Node'} ${++nodeSeq}`, profile, kind },
   })
   return id
 }
@@ -39,13 +43,22 @@ function addNode(profile: ProfileType, position?: { x: number; y: number }) {
 function connectNodes(source: string, target: string): boolean {
   if (!store.canConnect(source, target)) return false
   const edgeId = newEdgeId()
+  let kind: LinkKindType
   try {
-    store.connect(edgeId, source, target)
+    kind = store.connect(edgeId, source, target)
   } catch (e) {
     toast.add({ title: 'Connection failed', description: String(e), color: 'error' })
     return false
   }
-  addEdges({ id: edgeId, source, sourceHandle: 'bottom', target, targetHandle: 'top' })
+  addEdges({
+    id: edgeId,
+    source,
+    sourceHandle: 'bottom',
+    target,
+    targetHandle: 'top',
+    label: kind === 'packet' ? 'pkt' : 'cobs',
+    style: kind === 'packet' ? { strokeDasharray: '6 3' } : undefined,
+  })
   return true
 }
 
@@ -113,7 +126,7 @@ onMounted(async () => {
   // Seed a small default topology: one router with two edge nodes.
   const router = addNode('router', { x: 250, y: 50 })
   const nodeB = addNode('edge', { x: 100, y: 250 })
-  const nodeC = addNode('edge', { x: 400, y: 250 })
+  const nodeC = addNode('edge', { x: 400, y: 250 }, 'packet')
   connectNodes(router, nodeB)
   connectNodes(router, nodeC)
   void fitView()

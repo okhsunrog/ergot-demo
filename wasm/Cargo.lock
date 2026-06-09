@@ -260,6 +260,8 @@ dependencies = [
  "console_log",
  "embassy-futures",
  "ergot",
+ "futures-channel",
+ "futures-core",
  "futures-io",
  "getrandom",
  "gloo-timers",

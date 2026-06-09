@@ -2,6 +2,7 @@ import { reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import init, {
   initLogging,
+  LinkKind,
   NodeProfile,
   WasmNode,
   WasmLink,
@@ -10,6 +11,7 @@ import init, {
 } from '../wasm-pkg/ergot_demo_wasm'
 
 export type ProfileType = 'router' | 'edge'
+export type LinkKindType = 'stream' | 'packet'
 
 // WASM handles are plain pointers — keep them out of Vue's reactivity.
 const nodeHandles = new Map<string, WasmNode>()
@@ -17,6 +19,10 @@ const linkHandles = new Map<string, WasmLink>()
 
 function toWasmProfile(profile: ProfileType): NodeProfile {
   return profile === 'router' ? NodeProfile.Router : NodeProfile.Edge
+}
+
+function toWasmLinkKind(kind: LinkKindType): LinkKind {
+  return kind === 'packet' ? LinkKind.Packet : LinkKind.Stream
 }
 
 /**
@@ -44,8 +50,8 @@ export const useTopologyStore = defineStore('topology', () => {
     for (const id of nodeHandles.keys()) refresh(id)
   }
 
-  function createNode(id: string, profile: ProfileType) {
-    const node = new WasmNode(toWasmProfile(profile))
+  function createNode(id: string, profile: ProfileType, kind: LinkKindType = 'stream') {
+    const node = new WasmNode(toWasmProfile(profile), toWasmLinkKind(kind))
     nodeHandles.set(id, node)
     // Every node answers pings, so anything on the canvas is a ping target.
     void node.servePing()
@@ -72,8 +78,9 @@ export const useTopologyStore = defineStore('topology', () => {
     )
   }
 
-  /** Wire two canvas nodes together. Throws if the link is invalid. */
-  function connect(edgeId: string, sourceId: string, targetId: string) {
+  /** Wire two canvas nodes together. Throws if the link is invalid.
+   *  Returns the kind of the created link. */
+  function connect(edgeId: string, sourceId: string, targetId: string): LinkKindType {
     const source = nodeHandles.get(sourceId)
     const target = nodeHandles.get(targetId)
     if (!source || !target) throw new Error('unknown node')
@@ -89,6 +96,7 @@ export const useTopologyStore = defineStore('topology', () => {
       })
     refresh(sourceId)
     refresh(targetId)
+    return link.kind === LinkKind.Packet ? 'packet' : 'stream'
   }
 
   function disconnect(edgeId: string) {
@@ -97,12 +105,22 @@ export const useTopologyStore = defineStore('topology', () => {
   }
 
   /** Replace a node's stack with a different profile. Only valid when unlinked. */
-  function setProfile(id: string, profile: ProfileType) {
+  function setProfile(id: string, profile: ProfileType, kind: LinkKindType = 'stream') {
     const handle = nodeHandles.get(id)
     if (!handle) return
     if (handle.linkCount > 0) throw new Error('disconnect the node before changing its profile')
     destroyNode(id)
-    createNode(id, profile)
+    createNode(id, profile, kind)
+  }
+
+  /** Replace an edge node's uplink kind. Only valid when unlinked. */
+  function setLinkKind(id: string, kind: LinkKindType) {
+    const handle = nodeHandles.get(id)
+    if (!handle) return
+    if (handle.linkCount > 0) throw new Error('disconnect the node before changing its link kind')
+    if (handle.profile !== NodeProfile.Edge) return
+    destroyNode(id)
+    createNode(id, 'edge', kind)
   }
 
   /** Ping from one canvas node to another, using the target's address. */
@@ -138,6 +156,7 @@ export const useTopologyStore = defineStore('topology', () => {
     connect,
     disconnect,
     setProfile,
+    setLinkKind,
     ping,
     refresh,
     refreshAll,

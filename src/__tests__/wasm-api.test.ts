@@ -2,7 +2,7 @@
 // the wasm-bindgen module only needs Promise/Date/setTimeout/crypto here.
 import { readFileSync } from 'node:fs'
 import { expect, test } from 'vite-plus/test'
-import { initLogging, initSync, NodeProfile, WasmNode } from '../wasm-pkg/ergot_demo_wasm'
+import { initLogging, initSync, LinkKind, NodeProfile, WasmNode } from '../wasm-pkg/ergot_demo_wasm'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -85,6 +85,65 @@ test('edge pings another edge across the router (multi-hop)', async () => {
   linkB.free()
   a.free()
   b.free()
+  router.free()
+})
+
+test('packet link: ping over a frame-channel uplink', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  expect(edge.linkKind).toBe(LinkKind.Packet)
+
+  const link = router.connectTo(edge)
+  expect(link.kind).toBe(LinkKind.Packet)
+  await edge.servePing()
+
+  const res = await router.ping(link.netId, 2)
+  expect(res.value).toBe(42)
+
+  link.free()
+  edge.free()
+  router.free()
+})
+
+test('mixed kinds: stream edge pings packet edge across one router', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const streamy = new WasmNode(NodeProfile.Edge, LinkKind.Stream)
+  const packety = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const linkS = router.connectTo(streamy)
+  const linkP = router.connectTo(packety)
+  await packety.servePing()
+  await streamy.servePing()
+
+  // stream → router → packet
+  const res1 = await streamy.ping(linkP.netId, 2)
+  expect(res1.value).toBe(42)
+  // packet → router → stream
+  const res2 = await packety.ping(linkS.netId, 2)
+  expect(res2.value).toBe(42)
+
+  linkS.free()
+  linkP.free()
+  for (const n of [router, streamy, packety]) n.free()
+})
+
+test('packet link: disconnect and reconnect', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const link = router.connectTo(edge)
+  await edge.servePing()
+  await router.ping(link.netId, 2)
+
+  link.free()
+  await sleep(50)
+  expect(router.status()).toEqual({ profile: 'router', nets: [] })
+  expect(edge.linkCount).toBe(0)
+
+  const link2 = router.connectTo(edge)
+  const res = await router.ping(link2.netId, 2)
+  expect(res.value).toBe(42)
+
+  link2.free()
+  edge.free()
   router.free()
 })
 

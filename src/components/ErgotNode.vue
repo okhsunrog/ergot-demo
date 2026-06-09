@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Handle, Position, useVueFlow, type Connection } from '@vue-flow/core'
-import { useTopologyStore, type ProfileType } from '@/stores/topology'
+import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
 
 export interface ErgotNodeData {
   label: string
   profile: ProfileType
+  kind: LinkKindType
 }
 
 const props = defineProps<{ id: string; data: ErgotNodeData }>()
@@ -16,6 +17,11 @@ const { updateNodeData } = useVueFlow()
 const profileOptions = [
   { label: 'Router', value: 'router' },
   { label: 'Edge', value: 'edge' },
+]
+
+const kindOptions = [
+  { label: 'Stream (COBS)', value: 'stream' },
+  { label: 'Packet', value: 'packet' },
 ]
 
 const profileColors: Record<ProfileType, string> = {
@@ -43,8 +49,14 @@ const addressLabel = computed(() => {
 
 function onProfileChange(value: string) {
   const profile = value as ProfileType
-  store.setProfile(props.id, profile)
+  store.setProfile(props.id, profile, props.data.kind)
   updateNodeData(props.id, { profile })
+}
+
+function onKindChange(value: string) {
+  const kind = value as LinkKindType
+  store.setLinkKind(props.id, kind)
+  updateNodeData(props.id, { kind })
 }
 
 const isValidConnection = (conn: Connection) => store.canConnect(conn.source, conn.target)
@@ -80,6 +92,16 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
       size="xs"
       class="w-full"
       @update:model-value="onProfileChange"
+    />
+
+    <USelect
+      v-if="data.profile === 'edge'"
+      :model-value="data.kind"
+      :items="kindOptions"
+      :disabled="linked"
+      size="xs"
+      class="w-full mt-0.5"
+      @update:model-value="onKindChange"
     />
 
     <!-- Downlink handle (routers fan out to edges) -->
