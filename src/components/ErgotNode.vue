@@ -31,6 +31,29 @@ const profileColors: Record<ProfileType, string> = {
 
 const status = computed(() => store.statuses[props.id])
 
+const samples = computed(() => store.sensorData[props.id] ?? [])
+const isPublishing = computed(() => store.publishing[props.id] ?? false)
+
+/** Polyline points for a 100×20 sparkline of the recent readings. */
+const sparkline = computed(() => {
+  const data = samples.value
+  if (data.length < 2) return ''
+  let min = Infinity
+  let max = -Infinity
+  for (const s of data) {
+    if (s.value < min) min = s.value
+    if (s.value > max) max = s.value
+  }
+  const span = max - min || 1
+  return data
+    .map((s, i) => {
+      const x = (i / (data.length - 1)) * 100
+      const y = 18 - ((s.value - min) / span) * 16
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+})
+
 const linked = computed(() => {
   const s = status.value
   if (!s) return false
@@ -59,6 +82,10 @@ function onKindChange(value: string) {
   updateNodeData(props.id, { kind })
 }
 
+function togglePublish() {
+  store.togglePublisher(props.id)
+}
+
 const isValidConnection = (conn: Connection) => store.canConnect(conn.source, conn.target)
 </script>
 
@@ -78,10 +105,28 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
         class="inline-block w-1.5 h-1.5 rounded-full shrink-0"
         :style="{ background: profileColors[data.profile] }"
       />
-      <span class="font-medium text-(--ui-text-highlighted) truncate leading-tight">
+      <span class="font-medium text-(--ui-text-highlighted) truncate leading-tight flex-1">
         {{ data.label }}
       </span>
+      <button
+        class="publish-toggle"
+        :class="{ active: isPublishing }"
+        :title="isPublishing ? 'Stop publishing' : 'Publish sensor stream'"
+        @click.stop="togglePublish"
+      >
+        {{ isPublishing ? '■' : '▶' }}
+      </button>
     </div>
+
+    <svg v-if="sparkline" viewBox="0 0 100 20" class="w-full h-5 mb-0.5" preserveAspectRatio="none">
+      <polyline
+        :points="sparkline"
+        fill="none"
+        stroke="var(--ui-primary)"
+        stroke-width="1.5"
+        vector-effect="non-scaling-stroke"
+      />
+    </svg>
 
     <div class="text-[9px] text-(--ui-text-muted) mb-0.5 truncate">{{ addressLabel }}</div>
 
@@ -120,5 +165,23 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
   width: 110px;
   padding: 4px 6px;
   font-size: 10px;
+}
+
+.publish-toggle {
+  font-size: 8px;
+  line-height: 1;
+  padding: 2px 3px;
+  border-radius: 3px;
+  color: var(--ui-text-muted);
+  cursor: pointer;
+}
+
+.publish-toggle:hover {
+  color: var(--ui-text-highlighted);
+  background: var(--ui-bg-elevated);
+}
+
+.publish-toggle.active {
+  color: var(--ui-error);
 }
 </style>

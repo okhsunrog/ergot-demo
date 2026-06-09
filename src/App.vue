@@ -180,6 +180,7 @@ onMounted(async () => {
   refreshTimer = setInterval(() => store.refreshAll(), 1000)
   frameTimer = setInterval(() => {
     store.pollFrames()
+    store.pollSamples()
     animateActiveEdges()
   }, 150)
 })

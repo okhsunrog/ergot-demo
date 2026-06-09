@@ -290,3 +290,83 @@ test('disconnect frees both sides and reconnect works', async () => {
   edge.free()
   router.free()
 })
+
+test('sensor topic: broadcast fans out to all subscribers', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const a = new WasmNode(NodeProfile.Edge)
+  const b = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const linkA = router.connectTo(a)
+  const linkB = router.connectTo(b)
+  await router.subscribeSensor()
+  await a.subscribeSensor()
+  await b.subscribeSensor()
+  // Warm the links so the edges learn their addresses.
+  await a.ping(linkA.netId, 1, 200).catch(() => {})
+  await b.ping(linkB.netId, 1, 200).catch(() => {})
+
+  a.publishSensor(1.25)
+  await sleep(50)
+
+  // Both the router and the *other* edge hear the broadcast.
+  expect(router.takeSamples().samples.some((s) => s.value === 1.25)).toBe(true)
+  expect(b.takeSamples().samples.some((s) => s.value === 1.25)).toBe(true)
+
+  linkA.free()
+  linkB.free()
+  for (const n of [router, a, b]) n.free()
+})
+
+test('sensor topic: unicast reaches only the target', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const a = new WasmNode(NodeProfile.Edge)
+  const b = new WasmNode(NodeProfile.Edge)
+  const linkA = router.connectTo(a)
+  const linkB = router.connectTo(b)
+  await a.subscribeSensor()
+  await b.subscribeSensor()
+  await a.ping(linkA.netId, 1, 200).catch(() => {})
+  await b.ping(linkB.netId, 1, 200).catch(() => {})
+
+  a.publishSensorTo(linkB.netId, 2, 7.5)
+  await sleep(50)
+
+  expect(b.takeSamples().samples.some((s) => s.value === 7.5)).toBe(true)
+  expect(a.takeSamples().samples).toEqual([])
+
+  linkA.free()
+  linkB.free()
+  for (const n of [router, a, b]) n.free()
+})
+
+test('periodic publisher streams and full loss starves a subscriber', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const pub = new WasmNode(NodeProfile.Edge)
+  const sub = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const linkPub = router.connectTo(pub)
+  const linkSub = router.connectTo(sub)
+  await sub.subscribeSensor()
+  await pub.ping(linkPub.netId, 1, 200).catch(() => {})
+
+  pub.startPublisher(20)
+  expect(pub.publishing).toBe(true)
+  await sleep(200)
+  const flowing = sub.takeSamples().samples.length
+  expect(flowing).toBeGreaterThan(3)
+
+  linkSub.setImpairment(0, 100)
+  await sleep(100)
+  sub.takeSamples() // discard in-flight stragglers
+  await sleep(200)
+  expect(sub.takeSamples().samples).toEqual([])
+
+  linkSub.setImpairment(0, 0)
+  await sleep(200)
+  expect(sub.takeSamples().samples.length).toBeGreaterThan(3)
+
+  pub.stopPublisher()
+  expect(pub.publishing).toBe(false)
+
+  linkPub.free()
+  linkSub.free()
+  for (const n of [router, pub, sub]) n.free()
+})

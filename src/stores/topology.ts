@@ -41,6 +41,10 @@ export const useTopologyStore = defineStore('topology', () => {
   const frames = ref<FrameEvent[]>([])
   /** Last frame timestamp per canvas edge id, for edge activity animation. */
   const linkActivity = reactive<Record<string, number>>({})
+  /** Recent sensor readings per node id, newest last. */
+  const sensorData = reactive<Record<string, { ts: number; value: number }[]>>({})
+  /** Which nodes run a periodic sensor publisher. */
+  const publishing = reactive<Record<string, boolean>>({})
 
   async function initWasm() {
     if (ready.value) return
@@ -66,6 +70,30 @@ export const useTopologyStore = defineStore('topology', () => {
     frames.value = [...frames.value, ...events].slice(-MAX_FRAMES)
   }
 
+  /** Drain received sensor readings from every node into the reactive buffers. */
+  function pollSamples() {
+    for (const [id, handle] of nodeHandles) {
+      const { samples } = handle.takeSamples()
+      if (!samples.length) continue
+      const buf = (sensorData[id] ??= [])
+      for (const s of samples) buf.push({ ts: s.ts, value: s.value })
+      if (buf.length > 50) buf.splice(0, buf.length - 50)
+    }
+  }
+
+  /** Start/stop the periodic sensor publisher on a node. */
+  function togglePublisher(id: string, intervalMs = 100) {
+    const handle = nodeHandles.get(id)
+    if (!handle) return
+    if (publishing[id]) {
+      handle.stopPublisher()
+      publishing[id] = false
+    } else {
+      handle.startPublisher(intervalMs)
+      publishing[id] = true
+    }
+  }
+
   function setImpairment(edgeId: string, latencyMs: number, lossPct: number) {
     linkHandles.get(edgeId)?.setImpairment(latencyMs, lossPct)
   }
@@ -78,8 +106,9 @@ export const useTopologyStore = defineStore('topology', () => {
   function createNode(id: string, profile: ProfileType, kind: LinkKindType = 'stream') {
     const node = new WasmNode(toWasmProfile(profile), toWasmLinkKind(kind))
     nodeHandles.set(id, node)
-    // Every node answers pings, so anything on the canvas is a ping target.
+    // Every node answers pings and listens to the sensor topic.
     void node.servePing()
+    void node.subscribeSensor()
     refresh(id)
   }
 
@@ -88,6 +117,8 @@ export const useTopologyStore = defineStore('topology', () => {
     nodeHandles.get(id)?.free()
     nodeHandles.delete(id)
     delete statuses[id]
+    delete sensorData[id]
+    delete publishing[id]
   }
 
   /** Can `source` accept a new link to `target`? Used for canvas validation. */
@@ -176,8 +207,12 @@ export const useTopologyStore = defineStore('topology', () => {
     statuses,
     frames,
     linkActivity,
+    sensorData,
+    publishing,
     initWasm,
     pollFrames,
+    pollSamples,
+    togglePublisher,
     setImpairment,
     getImpairment,
     createNode,

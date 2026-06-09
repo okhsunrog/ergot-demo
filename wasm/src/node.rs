@@ -58,7 +58,11 @@ use mutex::raw_impls::cs::CriticalSectionRawMutex;
 
 use crate::duplex;
 
+// The demo's sensor stream: a plain f32 reading, fire-and-forget.
+ergot::topic!(SensorTopic, f32, "ergot-demo/sensor");
+
 const MTU: u16 = 512;
+const MAX_SAMPLES: usize = 64;
 const QUEUE_SIZE: usize = 4096;
 const BUF_SIZE: usize = 2048;
 const MAX_INTERFACES: usize = 16;
@@ -109,6 +113,21 @@ pub fn take_frame_events() -> FrameEventBatch {
 
 fn fmt_addr(a: &Address) -> String {
     format!("{}.{}:{}", a.network_id, a.node_id, a.port_id)
+}
+
+fn push_sample(
+    samples: &Rc<RefCell<VecDeque<SensorSample>>>,
+    msg: &ergot::socket::HeaderMessage<f32>,
+) {
+    let mut q = samples.borrow_mut();
+    if q.len() >= MAX_SAMPLES {
+        q.pop_front();
+    }
+    q.push_back(SensorSample {
+        ts: js_sys::Date::now(),
+        value: msg.t,
+        src: fmt_addr(&msg.hdr.src),
+    });
 }
 
 fn kind_name(kind: u8) -> String {
@@ -312,6 +331,25 @@ pub enum NodeStatus {
     },
 }
 
+/// One received sensor reading.
+#[derive(Serialize, Tsify, Clone)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorSample {
+    /// `Date.now()` at reception.
+    pub ts: f64,
+    pub value: f32,
+    /// Address of the publisher, e.g. "1.2:5".
+    pub src: String,
+}
+
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleBatch {
+    pub samples: Vec<SensorSample>,
+}
+
 // ---------------------------------------------------------------------------
 // WasmNode
 // ---------------------------------------------------------------------------
@@ -329,6 +367,10 @@ pub struct WasmNode {
     links: Rc<RefCell<Vec<Arc<WaitQueue>>>>,
     /// Edge nodes: the frame-tap label of the uplink sink, set while linked.
     edge_tap_label: Rc<RefCell<Option<String>>>,
+    /// Sensor readings received by the subscriber task.
+    samples: Rc<RefCell<VecDeque<SensorSample>>>,
+    /// Closer of the running sensor publisher task, if any.
+    publisher_closer: RefCell<Option<Arc<WaitQueue>>>,
 }
 
 #[wasm_bindgen]
@@ -366,6 +408,8 @@ impl WasmNode {
             services_closer: Arc::new(WaitQueue::new()),
             links: Rc::new(RefCell::new(Vec::new())),
             edge_tap_label,
+            samples: Rc::new(RefCell::new(VecDeque::new())),
+            publisher_closer: RefCell::new(None),
         }
     }
 
@@ -649,11 +693,139 @@ impl WasmNode {
             Either::Second(()) => Err(JsError::new(&format!("ping timed out after {timeout} ms"))),
         }
     }
+
+    /// Attach a sensor-topic subscriber. Received readings accumulate in a
+    /// ring buffer drained by `takeSamples()`. Runs until the node is freed.
+    #[wasm_bindgen(js_name = subscribeSensor)]
+    pub async fn subscribe_sensor(&self) {
+        let closer = self.services_closer.clone();
+        let samples = self.samples.clone();
+        match &self.stack {
+            Stack::Router(stack) => {
+                let stack = stack.clone();
+                spawn_local(async move {
+                    let recv = stack.topics().bounded_receiver::<SensorTopic, 16>(None);
+                    let recv = pin!(recv);
+                    let mut hdl = recv.subscribe();
+                    let recv_loop = async {
+                        loop {
+                            let msg = hdl.recv().await;
+                            push_sample(&samples, &msg);
+                        }
+                    };
+                    let _ = select(recv_loop, closer.wait()).await;
+                });
+            }
+            Stack::Edge { stack, .. } => {
+                let stack = stack.clone();
+                spawn_local(async move {
+                    let recv = stack.topics().bounded_receiver::<SensorTopic, 16>(None);
+                    let recv = pin!(recv);
+                    let mut hdl = recv.subscribe();
+                    let recv_loop = async {
+                        loop {
+                            let msg = hdl.recv().await;
+                            push_sample(&samples, &msg);
+                        }
+                    };
+                    let _ = select(recv_loop, closer.wait()).await;
+                });
+            }
+        }
+        yield_now().await;
+    }
+
+    /// Drain sensor readings received since the last call.
+    #[wasm_bindgen(js_name = takeSamples)]
+    pub fn take_samples(&self) -> SampleBatch {
+        SampleBatch {
+            samples: self.samples.borrow_mut().drain(..).collect(),
+        }
+    }
+
+    /// Broadcast a single sensor reading to the whole network.
+    #[wasm_bindgen(js_name = publishSensor)]
+    pub fn publish_sensor(&self, value: f32) -> Result<(), JsError> {
+        let res = match &self.stack {
+            Stack::Router(stack) => stack.topics().broadcast::<SensorTopic>(&value, None),
+            Stack::Edge { stack, .. } => stack.topics().broadcast::<SensorTopic>(&value, None),
+        };
+        res.map_err(|e| JsError::new(&format!("publish failed: {e:?}")))
+    }
+
+    /// Send a single sensor reading to one node (unicast, port 0 + topic key).
+    #[wasm_bindgen(js_name = publishSensorTo)]
+    pub fn publish_sensor_to(
+        &self,
+        network_id: u16,
+        node_id: u8,
+        value: f32,
+    ) -> Result<(), JsError> {
+        let dest = Address {
+            network_id,
+            node_id,
+            port_id: 0,
+        };
+        let res = match &self.stack {
+            Stack::Router(stack) => stack.topics().unicast::<SensorTopic>(dest, &value),
+            Stack::Edge { stack, .. } => stack.topics().unicast::<SensorTopic>(dest, &value),
+        };
+        res.map_err(|e| JsError::new(&format!("publish failed: {e:?}")))
+    }
+
+    /// Start a periodic publisher broadcasting a sine wave with a little
+    /// noise every `interval_ms`. Replaces any running publisher.
+    #[wasm_bindgen(js_name = startPublisher)]
+    pub fn start_publisher(&self, interval_ms: u32) {
+        self.stop_publisher();
+        let closer = Arc::new(WaitQueue::new());
+        *self.publisher_closer.borrow_mut() = Some(closer.clone());
+        let interval = interval_ms.max(20);
+
+        macro_rules! run_publisher {
+            ($stack:expr) => {{
+                let stack = $stack.clone();
+                spawn_local(async move {
+                    let publish_loop = async {
+                        loop {
+                            TimeoutFuture::new(interval).await;
+                            let t = js_sys::Date::now() / 1000.0;
+                            let value = ((t * core::f64::consts::TAU * 0.3).sin()
+                                + js_sys::Math::random() * 0.1) as f32;
+                            let _ = stack.topics().broadcast::<SensorTopic>(&value, None);
+                        }
+                    };
+                    let _ = select(publish_loop, closer.wait()).await;
+                });
+            }};
+        }
+        match &self.stack {
+            Stack::Router(stack) => run_publisher!(stack),
+            Stack::Edge { stack, .. } => run_publisher!(stack),
+        }
+    }
+
+    /// Stop the periodic publisher, if running.
+    #[wasm_bindgen(js_name = stopPublisher)]
+    pub fn stop_publisher(&self) {
+        if let Some(closer) = self.publisher_closer.borrow_mut().take() {
+            closer.close();
+        }
+    }
+
+    /// Is the periodic publisher running?
+    #[wasm_bindgen(getter)]
+    pub fn publishing(&self) -> bool {
+        self.publisher_closer.borrow().is_some()
+    }
 }
 
 impl Drop for WasmNode {
     fn drop(&mut self) {
         self.services_closer.close();
+        if let Some(closer) = self.publisher_closer.borrow_mut().take() {
+            closer.close();
+        }
         for closer in self.links.borrow_mut().drain(..) {
             closer.close();
         }
