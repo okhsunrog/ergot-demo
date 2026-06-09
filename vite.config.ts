@@ -60,10 +60,12 @@ export default defineConfig({
       },
       'wasm:build': {
         command: 'wasm-pack build wasm --target web --out-dir ../src/wasm-pkg',
-        // No vp cache: the ergot path dependency lives outside the workspace
-        // root, so vp's input globs cannot see its changes and would serve
-        // stale builds. cargo's own incremental cache keeps rebuilds fast.
-        cache: false,
+        // The ergot git dependency is pinned by wasm/Cargo.lock, which the
+        // auto inputs hash — so caching is sound. If you [patch] ergot to a
+        // local path (see wasm/Cargo.toml), set cache: false, since vp's
+        // input globs cannot see changes outside the workspace root.
+        cache: true,
+        input: [{ auto: true }, '!src/wasm-pkg/**', '!wasm/target/**'],
       },
     },
   },

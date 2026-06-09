@@ -14,13 +14,13 @@ Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 - [Vite+](https://viteplus.dev/) (`vp`) and bun
 - Rust with the `wasm32-unknown-unknown` target and `wasm-pack`
   (`cargo install wasm-pack`)
-- The ergot checkout this demo builds against: a git worktree of
-  [ergot](https://github.com/okhsunrog/ergot) on the `wasm-support` branch at
-  `../../rust/ergot-wasm` (relative to this repo):
 
-  ```sh
-  git -C ~/code/rust/ergot worktree add ../ergot-wasm wasm-support
-  ```
+The ergot dependency is fetched from the
+[`wasm-support` branch](https://github.com/okhsunrog/ergot/tree/wasm-support)
+of the ergot fork — no local ergot checkout is needed. To hack on ergot
+itself, use the `[patch]` override documented in `wasm/Cargo.toml` (and set
+`cache: false` on the `wasm:build` task in `vite.config.ts` so rebuilds pick
+up your local changes).
 
 ## Develop
 
