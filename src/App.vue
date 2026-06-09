@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Connection } from '@vue-flow/core'
 import ErgotNode from './components/ErgotNode.vue'
+import FrameInspector from './components/FrameInspector.vue'
 import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
 
 const store = useTopologyStore()
@@ -14,6 +15,7 @@ const {
   addNodes,
   addEdges,
   edges,
+  findNode,
   getSelectedNodes,
   getSelectedEdges,
   removeNodes,
@@ -97,6 +99,49 @@ function onKeyDown(e: KeyboardEvent) {
   }
 }
 
+// Frame inspector and per-link activity animation
+const showInspector = ref(true)
+
+function resolveLink(edgeId: string): string {
+  const edge = edges.value.find((e) => e.id === edgeId)
+  if (!edge) return edgeId.slice(0, 8)
+  const src = findNode(edge.source)?.data.label ?? edge.source
+  const tgt = findNode(edge.target)?.data.label ?? edge.target
+  return `${src} ⇄ ${tgt}`
+}
+
+function animateActiveEdges() {
+  const now = Date.now()
+  for (const edge of edges.value) {
+    const last = store.linkActivity[edge.id] ?? 0
+    const active = now - last < 600
+    if (edge.animated !== active) edge.animated = active
+  }
+}
+
+// Impairment controls for the selected link
+const latencyMs = ref(0)
+const lossPct = ref(0)
+const selectedEdge = computed(() => {
+  const sel = getSelectedEdges.value
+  return sel.length === 1 ? sel[0] : null
+})
+
+watch(selectedEdge, (edge) => {
+  if (!edge) return
+  const imp = store.getImpairment(edge.id)
+  latencyMs.value = imp?.latencyMs ?? 0
+  lossPct.value = imp?.lossPct ?? 0
+})
+
+function applyImpairment() {
+  const edge = selectedEdge.value
+  if (!edge) return
+  latencyMs.value = Math.max(0, Math.floor(latencyMs.value) || 0)
+  lossPct.value = Math.min(100, Math.max(0, Math.floor(lossPct.value) || 0))
+  store.setImpairment(edge.id, latencyMs.value, lossPct.value)
+}
+
 // Ping between the two selected nodes
 const pingResult = ref('')
 const selectedPair = computed(() => {
@@ -119,6 +164,7 @@ async function pingSelected() {
 }
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined
+let frameTimer: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
   await store.initWasm()
@@ -132,10 +178,15 @@ onMounted(async () => {
   void fitView()
 
   refreshTimer = setInterval(() => store.refreshAll(), 1000)
+  frameTimer = setInterval(() => {
+    store.pollFrames()
+    animateActiveEdges()
+  }, 150)
 })
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  if (frameTimer) clearInterval(frameTimer)
 })
 </script>
 
@@ -160,16 +211,45 @@ onUnmounted(() => {
             >Ping</UButton
           >
           <span v-if="pingResult" class="text-xs text-(--ui-text-muted)">{{ pingResult }}</span>
+          <div
+            v-if="selectedEdge"
+            class="flex items-center gap-1 text-xs text-(--ui-text-muted) border-l border-(--ui-border-muted) pl-2"
+          >
+            <span>lat</span>
+            <UInput
+              v-model.number="latencyMs"
+              type="number"
+              size="xs"
+              class="w-16"
+              @change="applyImpairment"
+            />
+            <span>ms · loss</span>
+            <UInput
+              v-model.number="lossPct"
+              type="number"
+              size="xs"
+              class="w-14"
+              @change="applyImpairment"
+            />
+            <span>%</span>
+          </div>
+          <UButton
+            :variant="showInspector ? 'solid' : 'outline'"
+            icon="i-lucide-list"
+            @click="showInspector = !showInspector"
+            >Frames</UButton
+          >
           <UColorModeButton />
         </div>
       </header>
-      <div class="flex-1">
+      <div class="flex-1 min-h-0">
         <VueFlow :default-viewport="{ zoom: 1 }" :min-zoom="0.2" :max-zoom="4" @connect="onConnect">
           <template #node-ergot="nodeProps">
             <ErgotNode :id="nodeProps.id" :data="nodeProps.data" />
           </template>
         </VueFlow>
       </div>
+      <FrameInspector v-if="showInspector" :frames="store.frames" :resolve-link="resolveLink" />
     </div>
   </UApp>
 </template>

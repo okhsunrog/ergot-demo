@@ -4,8 +4,10 @@ import init, {
   initLogging,
   LinkKind,
   NodeProfile,
+  takeFrameEvents,
   WasmNode,
   WasmLink,
+  type FrameEvent,
   type NodeStatus,
   type PingResult,
 } from '../wasm-pkg/ergot_demo_wasm'
@@ -30,9 +32,15 @@ function toWasmLinkKind(kind: LinkKindType): LinkKind {
  * per canvas edge. The canvas is the source of truth for topology; this
  * store keeps the WASM network in sync and exposes reactive node statuses.
  */
+const MAX_FRAMES = 100
+
 export const useTopologyStore = defineStore('topology', () => {
   const ready = ref(false)
   const statuses = reactive<Record<string, NodeStatus>>({})
+  /** Recent tapped frames, newest last. */
+  const frames = ref<FrameEvent[]>([])
+  /** Last frame timestamp per canvas edge id, for edge activity animation. */
+  const linkActivity = reactive<Record<string, number>>({})
 
   async function initWasm() {
     if (ready.value) return
@@ -48,6 +56,23 @@ export const useTopologyStore = defineStore('topology', () => {
 
   function refreshAll() {
     for (const id of nodeHandles.keys()) refresh(id)
+  }
+
+  /** Drain tapped frames from the WASM side into the reactive log. */
+  function pollFrames() {
+    const { events } = takeFrameEvents()
+    if (!events.length) return
+    for (const e of events) linkActivity[e.linkId] = e.ts
+    frames.value = [...frames.value, ...events].slice(-MAX_FRAMES)
+  }
+
+  function setImpairment(edgeId: string, latencyMs: number, lossPct: number) {
+    linkHandles.get(edgeId)?.setImpairment(latencyMs, lossPct)
+  }
+
+  function getImpairment(edgeId: string): { latencyMs: number; lossPct: number } | undefined {
+    const link = linkHandles.get(edgeId)
+    return link ? { latencyMs: link.latencyMs, lossPct: link.lossPct } : undefined
   }
 
   function createNode(id: string, profile: ProfileType, kind: LinkKindType = 'stream') {
@@ -84,7 +109,7 @@ export const useTopologyStore = defineStore('topology', () => {
     const source = nodeHandles.get(sourceId)
     const target = nodeHandles.get(targetId)
     if (!source || !target) throw new Error('unknown node')
-    const link = source.connectTo(target)
+    const link = source.connectTo(target, edgeId)
     linkHandles.set(edgeId, link)
     // Warm the link with one ping so the edge node learns its address.
     void source
@@ -149,7 +174,12 @@ export const useTopologyStore = defineStore('topology', () => {
   return {
     ready,
     statuses,
+    frames,
+    linkActivity,
     initWasm,
+    pollFrames,
+    setImpairment,
+    getImpairment,
     createNode,
     destroyNode,
     canConnect,

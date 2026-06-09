@@ -2,9 +2,11 @@
 
 A browser playground for [ergot](https://github.com/jamesmunns/ergot) networks.
 Draw a topology on a canvas and it runs for real: every node on the canvas is a
-full ergot NetStack compiled to WebAssembly, links are in-memory byte pipes
-carrying COBS-framed ergot frames, and pings route through actual Router /
-DirectEdge profiles.
+full ergot NetStack compiled to WebAssembly, links carry real ergot frames
+(stream/COBS or packet flavor, per link), and pings route through actual
+Router / DirectEdge profiles. A frame inspector shows every frame on the wire,
+links animate with traffic, and per-link latency/loss knobs let you watch the
+UDP-like semantics degrade honestly.
 
 Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 (`wasm/`), managed with [Vite+](https://viteplus.dev/).
