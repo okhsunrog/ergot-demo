@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Node, Edge, Connection } from '@vue-flow/core'
-import init, { ergot_ping_test } from './wasm-pkg/ergot_demo_wasm'
+import init, { initLogging, NodeRole, WasmNode } from './wasm-pkg/ergot_demo_wasm'
 import ErgotNode from './components/ErgotNode.vue'
 import type { ProfileType } from './components/ErgotNode.vue'
 
@@ -85,12 +85,26 @@ const wasmReady = ref(false)
 const pingResult = ref('')
 
 init().then(() => {
+  initLogging(import.meta.env.DEV ? 'debug' : 'info')
   wasmReady.value = true
 })
 
 async function runPingTest() {
   pingResult.value = 'Pinging...'
-  pingResult.value = await ergot_ping_test()
+  const ctrl = new WasmNode(NodeRole.Controller)
+  const tgt = new WasmNode(NodeRole.Target)
+  try {
+    const link = ctrl.connectTo(tgt)
+    await tgt.servePing()
+    const res = await ctrl.ping(1, 2)
+    pingResult.value = `Ping OK: ${res.value} in ${res.latencyMs.toFixed(1)} ms`
+    link.free()
+  } catch (e) {
+    pingResult.value = `Ping failed: ${e}`
+  } finally {
+    tgt.free()
+    ctrl.free()
+  }
 }
 </script>
 
