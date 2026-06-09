@@ -1,5 +1,7 @@
 # ergot-demo
 
+**Live demo: <https://okhsunrog.github.io/ergot-demo/>**
+
 A browser playground for [ergot](https://github.com/jamesmunns/ergot) networks.
 Draw a topology on a canvas and it runs for real: every node on the canvas is a
 full ergot NetStack compiled to WebAssembly, links carry real ergot frames
