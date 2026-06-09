@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_log = "1.0.0"
-ergot = { path = "../../../rust/ergot/crates/ergot", default-features = false, features = [
+ergot = { path = "../../../rust/ergot-wasm/crates/ergot", default-features = false, features = [
   "std",
   "futures-io",
 ] }
@@ -17,7 +17,6 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3.92"
 log = "0.4.29"
 mutex = "1.0.2"
-tokio_with_wasm = { version = "0.9.0", features = ["rt", "time"] }
 wasm-bindgen = "0.2.115"
 wasm-bindgen-futures = "0.4.65"
 web-sys = { version = "0.3.94", features = ["console"] }

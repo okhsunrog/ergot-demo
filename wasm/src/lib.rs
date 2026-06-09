@@ -49,7 +49,8 @@ fn register_edge(
     processor: EdgeFrameProcessor,
     initial_state: InterfaceState,
 ) {
-    // Set interface state synchronously before spawning workers
+    // Set interface state synchronously before spawning workers; the
+    // RxWorker only manages the Down transition on exit.
     stack.manage_profile(|im| {
         im.set_interface_state((), initial_state).expect("failed to set state");
     });
@@ -66,11 +67,7 @@ fn register_edge(
         );
         let mut frame_buf = vec![0u8; 2048];
         let mut scratch_buf = vec![0u8; 2048];
-        // Pass Down as initial_state since we already set the real state above.
-        // RxWorker::run() will set this, but we don't want it to overwrite our state.
-        // Actually, let's just run the inner loop directly — but run() also handles
-        // cleanup on drop. Let's pass the same state so it's a no-op re-set.
-        let _ = rx_worker.run(initial_state, &mut frame_buf, &mut scratch_buf).await;
+        let _ = rx_worker.run(&mut frame_buf, &mut scratch_buf).await;
     });
 
     // TX worker
