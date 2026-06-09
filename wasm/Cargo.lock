@@ -84,6 +84,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "console_log"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,12 +249,14 @@ dependencies = [
  "rand",
  "rand_core",
  "serde",
+ "web-time",
 ]
 
 [[package]]
 name = "ergot-demo-wasm"
 version = "0.1.0"
 dependencies = [
+ "console_error_panic_hook",
  "console_log",
  "embassy-futures",
  "ergot",
@@ -255,6 +267,7 @@ dependencies = [
  "log",
  "maitake-sync",
  "mutex",
+ "rand",
  "serde",
  "tsify-next",
  "wasm-bindgen",
@@ -1060,6 +1073,16 @@ name = "web-sys"
 version = "0.3.94"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd70027e39b12f0849461e08ffc50b9cd7688d942c1c8e3c7b22273236b4dd0a"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

@@ -1,78 +1,81 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
-import type { Node, Edge, Connection } from '@vue-flow/core'
-import init, { initLogging, NodeRole, WasmNode } from './wasm-pkg/ergot_demo_wasm'
+import type { Connection } from '@vue-flow/core'
 import ErgotNode from './components/ErgotNode.vue'
-import type { ProfileType } from './components/ErgotNode.vue'
+import { useTopologyStore, type ProfileType } from '@/stores/topology'
 
-let nextId = 4
-
-const initialNodes: Node[] = [
-  {
-    id: '1',
-    type: 'ergot',
-    position: { x: 250, y: 50 },
-    data: { label: 'Router A', profile: 'root-router' as ProfileType },
-  },
-  {
-    id: '2',
-    type: 'ergot',
-    position: { x: 100, y: 250 },
-    data: { label: 'Node B', profile: 'edge' as ProfileType },
-  },
-  {
-    id: '3',
-    type: 'ergot',
-    position: { x: 400, y: 250 },
-    data: { label: 'Node C', profile: 'edge' as ProfileType },
-  },
-]
-
-const initialEdges: Edge[] = [
-  { id: 'e1-2', source: '1', sourceHandle: 'bottom', target: '2', targetHandle: 'top' },
-  { id: 'e1-3', source: '1', sourceHandle: 'bottom', target: '3', targetHandle: 'top' },
-]
+const store = useTopologyStore()
+const toast = useToast()
 
 const {
   fitView,
   project,
   addNodes,
   addEdges,
+  edges,
   getSelectedNodes,
   getSelectedEdges,
   removeNodes,
   removeEdges,
-} = useVueFlow({
-  nodes: initialNodes,
-  edges: initialEdges,
-})
+} = useVueFlow({ nodes: [], edges: [] })
 
-function addNode() {
-  const id = String(nextId++)
+let nodeSeq = 0
+const newNodeId = () => `n-${crypto.randomUUID()}`
+const newEdgeId = () => `e-${crypto.randomUUID()}`
+
+function addNode(profile: ProfileType, position?: { x: number; y: number }) {
+  const id = newNodeId()
+  store.createNode(id, profile)
   addNodes({
     id,
     type: 'ergot',
-    position: project({ x: 300, y: 200 }),
-    data: { label: `Node ${id}`, profile: 'edge' as ProfileType },
+    position: position ?? project({ x: 250 + Math.random() * 100, y: 150 + Math.random() * 100 }),
+    data: { label: `${profile === 'router' ? 'Router' : 'Node'} ${++nodeSeq}`, profile },
   })
+  return id
+}
+
+function connectNodes(source: string, target: string): boolean {
+  if (!store.canConnect(source, target)) return false
+  const edgeId = newEdgeId()
+  try {
+    store.connect(edgeId, source, target)
+  } catch (e) {
+    toast.add({ title: 'Connection failed', description: String(e), color: 'error' })
+    return false
+  }
+  addEdges({ id: edgeId, source, sourceHandle: 'bottom', target, targetHandle: 'top' })
+  return true
 }
 
 function onConnect(connection: Connection) {
-  addEdges({
-    id: `e${connection.source}-${connection.target}`,
-    source: connection.source,
-    sourceHandle: connection.sourceHandle,
-    target: connection.target,
-    targetHandle: connection.targetHandle,
-  })
+  if (!store.canConnect(connection.source, connection.target)) {
+    toast.add({
+      title: 'Invalid connection',
+      description: 'Links go from a router to an unlinked edge node.',
+      color: 'warning',
+    })
+    return
+  }
+  connectNodes(connection.source, connection.target)
 }
 
 function deleteSelected() {
   const selectedNodes = getSelectedNodes.value
   const selectedEdges = getSelectedEdges.value
+
+  // Tear down explicitly selected links plus all links of deleted nodes.
+  const nodeIds = new Set(selectedNodes.map((n) => n.id))
+  const edgesToDrop = edges.value.filter(
+    (e) =>
+      selectedEdges.some((s) => s.id === e.id) || nodeIds.has(e.source) || nodeIds.has(e.target),
+  )
+  for (const edge of edgesToDrop) store.disconnect(edge.id)
+  if (edgesToDrop.length) removeEdges(edgesToDrop.map((e) => e.id))
+
+  for (const id of nodeIds) store.destroyNode(id)
   if (selectedNodes.length) removeNodes(selectedNodes)
-  if (selectedEdges.length) removeEdges(selectedEdges)
 }
 
 function onKeyDown(e: KeyboardEvent) {
@@ -81,31 +84,46 @@ function onKeyDown(e: KeyboardEvent) {
   }
 }
 
-const wasmReady = ref(false)
+// Ping between the two selected nodes
 const pingResult = ref('')
-
-init().then(() => {
-  initLogging(import.meta.env.DEV ? 'debug' : 'info')
-  wasmReady.value = true
+const selectedPair = computed(() => {
+  const sel = getSelectedNodes.value
+  return sel.length === 2 ? sel : null
 })
 
-async function runPingTest() {
-  pingResult.value = 'Pinging...'
-  const ctrl = new WasmNode(NodeRole.Controller)
-  const tgt = new WasmNode(NodeRole.Target)
+async function pingSelected() {
+  const pair = selectedPair.value
+  if (!pair) return
+  const [a, b] = pair
+  if (!a || !b) return
+  pingResult.value = `${a.data.label} → ${b.data.label}: ...`
   try {
-    const link = ctrl.connectTo(tgt)
-    await tgt.servePing()
-    const res = await ctrl.ping(1, 2)
-    pingResult.value = `Ping OK: ${res.value} in ${res.latencyMs.toFixed(1)} ms`
-    link.free()
+    const res = await store.ping(a.id, b.id)
+    pingResult.value = `${a.data.label} → ${b.data.label}: ${res.latencyMs.toFixed(1)} ms`
   } catch (e) {
-    pingResult.value = `Ping failed: ${e}`
-  } finally {
-    tgt.free()
-    ctrl.free()
+    pingResult.value = `${a.data.label} → ${b.data.label}: ${e instanceof Error ? e.message : e}`
   }
 }
+
+let refreshTimer: ReturnType<typeof setInterval> | undefined
+
+onMounted(async () => {
+  await store.initWasm()
+
+  // Seed a small default topology: one router with two edge nodes.
+  const router = addNode('router', { x: 250, y: 50 })
+  const nodeB = addNode('edge', { x: 100, y: 250 })
+  const nodeC = addNode('edge', { x: 400, y: 250 })
+  connectNodes(router, nodeB)
+  connectNodes(router, nodeC)
+  void fitView()
+
+  refreshTimer = setInterval(() => store.refreshAll(), 1000)
+})
+
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer)
+})
 </script>
 
 <template>
@@ -115,29 +133,27 @@ async function runPingTest() {
         class="flex items-center justify-between px-4 py-2 border-b border-(--ui-border-muted) bg-(--ui-bg-elevated)"
       >
         <h1 class="text-lg font-semibold text-(--ui-text-highlighted)">Ergot Network Topology</h1>
-        <div class="flex gap-2">
-          <UButton icon="i-lucide-plus" @click="addNode">Add Node</UButton>
-          <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected"
-            >Delete Selected</UButton
+        <div class="flex gap-2 items-center">
+          <UButton icon="i-lucide-router" :disabled="!store.ready" @click="addNode('router')"
+            >Add Router</UButton
           >
-          <UButton v-if="wasmReady" variant="outline" @click="runPingTest">Ping Test</UButton>
-          <span v-if="pingResult" class="text-xs text-(--ui-text-muted) self-center">{{
-            pingResult
-          }}</span>
+          <UButton icon="i-lucide-plus" :disabled="!store.ready" @click="addNode('edge')"
+            >Add Node</UButton
+          >
+          <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected"
+            >Delete</UButton
+          >
+          <UButton v-if="selectedPair" variant="outline" icon="i-lucide-radio" @click="pingSelected"
+            >Ping</UButton
+          >
+          <span v-if="pingResult" class="text-xs text-(--ui-text-muted)">{{ pingResult }}</span>
           <UColorModeButton />
         </div>
       </header>
       <div class="flex-1">
-        <VueFlow
-          :default-viewport="{ zoom: 1 }"
-          :min-zoom="0.2"
-          :max-zoom="4"
-          fit-view-on-init
-          @nodes-initialized="fitView"
-          @connect="onConnect"
-        >
+        <VueFlow :default-viewport="{ zoom: 1 }" :min-zoom="0.2" :max-zoom="4" @connect="onConnect">
           <template #node-ergot="nodeProps">
-            <ErgotNode :data="nodeProps.data" />
+            <ErgotNode :id="nodeProps.id" :data="nodeProps.data" />
           </template>
         </VueFlow>
       </div>

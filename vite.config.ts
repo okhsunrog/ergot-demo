@@ -60,8 +60,10 @@ export default defineConfig({
       },
       'wasm:build': {
         command: 'wasm-pack build wasm --target web --out-dir ../src/wasm-pkg',
-        cache: true,
-        input: [{ auto: true }, '!src/wasm-pkg/**', '!wasm/target/**'],
+        // No vp cache: the ergot path dependency lives outside the workspace
+        // root, so vp's input globs cannot see its changes and would serve
+        // stale builds. cargo's own incremental cache keeps rebuilds fast.
+        cache: false,
       },
     },
   },

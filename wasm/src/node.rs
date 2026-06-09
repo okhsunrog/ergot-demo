@@ -1,10 +1,12 @@
 //! Handle-based WASM API: nodes, links, and per-node services.
 //!
-//! A [`WasmNode`] owns one ergot NetStack. [`WasmNode::connect_to`] wires a
-//! controller node to a target node with an in-memory duplex pipe and spawns
-//! the transport workers; the returned [`WasmLink`] tears everything down on
-//! `disconnect()`/`free()`. Freeing a node stops its service tasks and any
-//! attached link.
+//! A [`WasmNode`] owns one ergot NetStack with a profile chosen at
+//! construction: a `Router` (many downlinks, each its own network segment)
+//! or a DirectEdge `Edge` (single uplink). [`WasmNode::connect_to`] wires a
+//! router to an edge with an in-memory duplex pipe and spawns the transport
+//! workers; the returned [`WasmLink`] tears everything down on
+//! `disconnect()`/`free()`. Freeing a node stops its service tasks and all
+//! attached links.
 
 use std::cell::RefCell;
 use std::pin::pin;
@@ -23,7 +25,10 @@ use ergot::{
     Address,
     interface_manager::{
         Interface, InterfaceState, Profile,
-        profiles::direct_edge::{CENTRAL_NODE_ID, DirectEdge, EDGE_NODE_ID, EdgeFrameProcessor},
+        profiles::{
+            direct_edge::{DirectEdge, EDGE_NODE_ID, EdgeFrameProcessor},
+            router::{Router, RouterFrameProcessor},
+        },
         transports::futures_io::{RxWorker, tx_worker},
         utils::{
             cobs_stream,
@@ -40,6 +45,8 @@ use crate::duplex;
 const MTU: u16 = 512;
 const QUEUE_SIZE: usize = 4096;
 const BUF_SIZE: usize = 2048;
+const MAX_INTERFACES: usize = 16;
+const MAX_SEEDS: usize = 16;
 
 struct WasmInterface;
 impl Interface for WasmInterface {
@@ -47,15 +54,24 @@ impl Interface for WasmInterface {
 }
 
 type EdgeStack = ArcNetStack<CriticalSectionRawMutex, DirectEdge<WasmInterface>>;
+type RouterStack = ArcNetStack<
+    CriticalSectionRawMutex,
+    Router<WasmInterface, rand::rngs::StdRng, MAX_INTERFACES, MAX_SEEDS>,
+>;
 
-/// Which side of a DirectEdge link a node plays.
+enum Stack {
+    Router(RouterStack),
+    Edge { stack: EdgeStack, queue: StdQueue },
+}
+
+/// Which ergot profile a node runs.
 #[wasm_bindgen]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum NodeRole {
-    /// Link controller: owns the network id of the link (router/PC side).
-    Controller,
-    /// Link target: discovers its network id from the controller (device side).
-    Target,
+pub enum NodeProfile {
+    /// Router profile: many downlinks, each assigned its own network id.
+    Router,
+    /// DirectEdge target: a single uplink to a router.
+    Edge,
 }
 
 /// Result of a successful ping.
@@ -69,123 +85,183 @@ pub struct PingResult {
     pub latency_ms: f64,
 }
 
-/// Current state of a node's (single) interface.
+/// Current state of a node, for display on the canvas.
 #[derive(Serialize, Tsify)]
 #[tsify(into_wasm_abi)]
-#[serde(tag = "status", rename_all = "lowercase", rename_all_fields = "camelCase")]
-pub enum LinkStatus {
-    Down,
-    Inactive,
-    Active { net_id: u16, node_id: u8 },
+#[serde(tag = "profile", rename_all = "lowercase", rename_all_fields = "camelCase")]
+pub enum NodeStatus {
+    /// Router: the network ids of its active downlinks.
+    Router { nets: Vec<u16> },
+    /// Edge: the state of its single uplink.
+    Edge {
+        status: String,
+        net_id: Option<u16>,
+        node_id: Option<u8>,
+    },
 }
 
 /// One ergot node (a full NetStack) living in this browser tab.
 #[wasm_bindgen]
 pub struct WasmNode {
-    stack: EdgeStack,
-    queue: StdQueue,
-    role: NodeRole,
+    stack: Stack,
+    profile: NodeProfile,
     /// Closes node-owned service tasks (ping server, ...) on drop.
     services_closer: Arc<WaitQueue>,
-    /// Closer of the currently attached link, if any. Shared with [`WasmLink`].
-    link: Rc<RefCell<Option<Arc<WaitQueue>>>>,
+    /// Closers of currently attached links. Shared with [`WasmLink`]s.
+    links: Rc<RefCell<Vec<Arc<WaitQueue>>>>,
 }
 
 #[wasm_bindgen]
 impl WasmNode {
     #[wasm_bindgen(constructor)]
-    pub fn new(role: NodeRole) -> WasmNode {
-        let queue = new_std_queue(QUEUE_SIZE);
-        let sink = cobs_stream::Sink::new_from_handle(queue.clone(), MTU);
-        let stack = match role {
-            NodeRole::Controller => EdgeStack::new_with_profile(DirectEdge::new_controller(
-                sink,
-                InterfaceState::Down,
-            )),
-            NodeRole::Target => EdgeStack::new_with_profile(DirectEdge::new_target(sink)),
+    pub fn new(profile: NodeProfile) -> WasmNode {
+        let stack = match profile {
+            NodeProfile::Router => {
+                Stack::Router(RouterStack::new_with_profile(Router::new_std()))
+            }
+            NodeProfile::Edge => {
+                let queue = new_std_queue(QUEUE_SIZE);
+                let sink = cobs_stream::Sink::new_from_handle(queue.clone(), MTU);
+                Stack::Edge {
+                    stack: EdgeStack::new_with_profile(DirectEdge::new_target(sink)),
+                    queue,
+                }
+            }
         };
         WasmNode {
             stack,
-            queue,
-            role,
+            profile,
             services_closer: Arc::new(WaitQueue::new()),
-            link: Rc::new(RefCell::new(None)),
+            links: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
     #[wasm_bindgen(getter)]
-    pub fn role(&self) -> NodeRole {
-        self.role
+    pub fn profile(&self) -> NodeProfile {
+        self.profile
     }
 
-    /// Is a link currently attached?
-    #[wasm_bindgen(getter)]
-    pub fn linked(&self) -> bool {
-        self.link.borrow().is_some()
+    /// Number of currently attached links.
+    #[wasm_bindgen(getter, js_name = linkCount)]
+    pub fn link_count(&self) -> usize {
+        self.links.borrow().len()
     }
 
-    /// Current interface state of this node.
-    #[wasm_bindgen(js_name = linkStatus)]
-    pub fn link_status(&self) -> LinkStatus {
-        match self.stack.manage_profile(|im| im.interface_state(())) {
-            Some(InterfaceState::Active { net_id, node_id }) => {
-                LinkStatus::Active { net_id, node_id }
+    /// Current state of the node (router downlink nets / edge uplink state).
+    pub fn status(&self) -> NodeStatus {
+        match &self.stack {
+            Stack::Router(stack) => NodeStatus::Router {
+                nets: stack.manage_profile(|im| im.get_nets()),
+            },
+            Stack::Edge { stack, .. } => {
+                let state = stack.manage_profile(|im| im.interface_state(()));
+                match state {
+                    Some(InterfaceState::Active { net_id, node_id }) => NodeStatus::Edge {
+                        status: "active".into(),
+                        net_id: Some(net_id),
+                        node_id: Some(node_id),
+                    },
+                    Some(InterfaceState::Inactive) => NodeStatus::Edge {
+                        status: "inactive".into(),
+                        net_id: None,
+                        node_id: None,
+                    },
+                    _ => NodeStatus::Edge {
+                        status: "down".into(),
+                        net_id: None,
+                        node_id: None,
+                    },
+                }
             }
-            Some(InterfaceState::Inactive) => LinkStatus::Inactive,
-            _ => LinkStatus::Down,
         }
     }
 
-    /// Connect this node (controller) to a target node with an in-memory
-    /// duplex pipe. `net_id` is the network id of the link (default 1).
+    /// Connect this node (router) to an edge node with an in-memory duplex
+    /// pipe. The router assigns the link its own network id.
     #[wasm_bindgen(js_name = connectTo)]
-    pub fn connect_to(&self, target: &WasmNode, net_id: Option<u16>) -> Result<WasmLink, JsError> {
-        if self.role != NodeRole::Controller || target.role != NodeRole::Target {
+    pub fn connect_to(&self, target: &WasmNode) -> Result<WasmLink, JsError> {
+        let Stack::Router(router) = &self.stack else {
             return Err(JsError::new(
-                "connectTo must be called as controller.connectTo(target)",
+                "connectTo must be called as router.connectTo(edge)",
             ));
+        };
+        let Stack::Edge {
+            stack: edge,
+            queue: edge_queue,
+        } = &target.stack
+        else {
+            return Err(JsError::new(
+                "connectTo target must be an edge node (router-to-router links are not supported yet)",
+            ));
+        };
+        if !target.links.borrow().is_empty() {
+            return Err(JsError::new("edge node is already linked"));
         }
-        if self.link.borrow().is_some() || target.link.borrow().is_some() {
-            return Err(JsError::new("node is already linked"));
-        }
-        let net_id = net_id.unwrap_or(1);
+
         let closer = Arc::new(WaitQueue::new());
 
-        // Two unidirectional pipes: ctrl→tgt and tgt→ctrl
-        let (ctrl_writer, tgt_reader) = duplex::pipe();
-        let (tgt_writer, ctrl_reader) = duplex::pipe();
+        // Two unidirectional pipes: router→edge and edge→router
+        let (router_writer, edge_reader) = duplex::pipe();
+        let (edge_writer, router_reader) = duplex::pipe();
 
-        spawn_link_side(
-            self.stack.clone(),
-            ctrl_reader,
-            ctrl_writer,
-            self.queue.clone(),
-            EdgeFrameProcessor::new_controller(net_id),
-            InterfaceState::Active {
-                net_id,
-                node_id: CENTRAL_NODE_ID,
-            },
-            closer.clone(),
-        )?;
-        spawn_link_side(
-            target.stack.clone(),
-            tgt_reader,
-            tgt_writer,
-            target.queue.clone(),
-            EdgeFrameProcessor::new(),
-            InterfaceState::Active {
-                net_id: 0,
-                node_id: EDGE_NODE_ID,
-            },
-            closer.clone(),
-        )?;
+        // Router side: register a new interface; the profile assigns a net id.
+        let router_queue = new_std_queue(QUEUE_SIZE);
+        let sink = cobs_stream::Sink::new_from_handle(router_queue.clone(), MTU);
+        let res = router.manage_profile(|im| {
+            let ident = im.register_interface(sink).ok()?;
+            let net_id = im.net_id_of(ident)?;
+            im.set_interface_closer(ident, closer.clone());
+            Some((ident, net_id))
+        });
+        let Some((ident, net_id)) = res else {
+            return Err(JsError::new("router has no free interface slots"));
+        };
 
-        *self.link.borrow_mut() = Some(closer.clone());
-        *target.link.borrow_mut() = Some(closer.clone());
+        // Router-side workers
+        let rx_router = router.clone();
+        let rx_closer = closer.clone();
+        spawn_local(async move {
+            let mut rx_worker = RxWorker::new(
+                rx_router.clone(),
+                router_reader,
+                RouterFrameProcessor::new(net_id),
+                ident,
+            )
+            .with_closer(rx_closer.clone());
+            let mut frame = vec![0u8; BUF_SIZE];
+            let mut scratch = vec![0u8; BUF_SIZE];
+            let _ = rx_worker.run(&mut frame, &mut scratch).await;
+            rx_closer.close();
+            drop(rx_worker);
+            rx_router.manage_profile(|im| {
+                let _ = im.deregister_interface(ident);
+            });
+        });
+        spawn_tx_worker(router_writer, router_queue, closer.clone());
+
+        // Edge side: single DirectEdge interface, discovers net id from frames.
+        if let Err(e) = spawn_edge_side(
+            edge.clone(),
+            edge_reader,
+            edge_writer,
+            edge_queue.clone(),
+            closer.clone(),
+        ) {
+            // Roll back the router-side registration.
+            closer.close();
+            router.manage_profile(|im| {
+                let _ = im.deregister_interface(ident);
+            });
+            return Err(e);
+        }
+
+        self.links.borrow_mut().push(closer.clone());
+        target.links.borrow_mut().push(closer.clone());
 
         Ok(WasmLink {
             closer,
-            ends: [self.link.clone(), target.link.clone()],
+            net_id,
+            ends: [self.links.clone(), target.links.clone()],
         })
     }
 
@@ -194,26 +270,51 @@ impl WasmNode {
     /// attached and ready.
     #[wasm_bindgen(js_name = servePing)]
     pub async fn serve_ping(&self) {
-        let stack = self.stack.clone();
         let closer = self.services_closer.clone();
-        spawn_local(async move {
-            let server = stack
-                .endpoints()
-                .bounded_server::<ErgotPingEndpoint, 4>(Some("ping"));
-            let server = pin!(server);
-            let mut hdl = server.attach();
-            let serve_loop = async {
-                loop {
-                    let _ = hdl
-                        .serve(|val: &u32| {
-                            let v = *val;
-                            async move { v }
-                        })
-                        .await;
-                }
-            };
-            let _ = select(serve_loop, closer.wait()).await;
-        });
+        match &self.stack {
+            Stack::Router(stack) => {
+                let stack = stack.clone();
+                spawn_local(async move {
+                    let server = stack
+                        .endpoints()
+                        .bounded_server::<ErgotPingEndpoint, 4>(Some("ping"));
+                    let server = pin!(server);
+                    let mut hdl = server.attach();
+                    let serve_loop = async {
+                        loop {
+                            let _ = hdl
+                                .serve(|val: &u32| {
+                                    let v = *val;
+                                    async move { v }
+                                })
+                                .await;
+                        }
+                    };
+                    let _ = select(serve_loop, closer.wait()).await;
+                });
+            }
+            Stack::Edge { stack, .. } => {
+                let stack = stack.clone();
+                spawn_local(async move {
+                    let server = stack
+                        .endpoints()
+                        .bounded_server::<ErgotPingEndpoint, 4>(Some("ping"));
+                    let server = pin!(server);
+                    let mut hdl = server.attach();
+                    let serve_loop = async {
+                        loop {
+                            let _ = hdl
+                                .serve(|val: &u32| {
+                                    let v = *val;
+                                    async move { v }
+                                })
+                                .await;
+                        }
+                    };
+                    let _ = select(serve_loop, closer.wait()).await;
+                });
+            }
+        }
         // Yield once so the spawned task runs and attaches the server.
         yield_now().await;
     }
@@ -235,10 +336,20 @@ impl WasmNode {
         let timeout = timeout_ms.unwrap_or(1_000);
         let start = js_sys::Date::now();
         let req = async {
-            self.stack
-                .endpoints()
-                .request::<ErgotPingEndpoint>(addr, &42u32, Some("ping"))
-                .await
+            match &self.stack {
+                Stack::Router(stack) => {
+                    stack
+                        .endpoints()
+                        .request::<ErgotPingEndpoint>(addr, &42u32, Some("ping"))
+                        .await
+                }
+                Stack::Edge { stack, .. } => {
+                    stack
+                        .endpoints()
+                        .request::<ErgotPingEndpoint>(addr, &42u32, Some("ping"))
+                        .await
+                }
+            }
         };
         match select(req, TimeoutFuture::new(timeout)).await {
             Either::First(Ok(value)) => Ok(PingResult {
@@ -254,27 +365,34 @@ impl WasmNode {
 impl Drop for WasmNode {
     fn drop(&mut self) {
         self.services_closer.close();
-        if let Some(closer) = self.link.borrow_mut().take() {
+        for closer in self.links.borrow_mut().drain(..) {
             closer.close();
         }
     }
 }
 
-/// A live link between two nodes. `disconnect()` (or `free()`) tears down
-/// the transport workers on both sides; the nodes return to Down and can
-/// be reconnected.
+/// A live link between a router and an edge node. `disconnect()` (or
+/// `free()`) tears down the transport workers on both sides; the edge
+/// returns to Down and the router frees the interface slot.
 #[wasm_bindgen]
 pub struct WasmLink {
     closer: Arc<WaitQueue>,
-    ends: [Rc<RefCell<Option<Arc<WaitQueue>>>>; 2],
+    net_id: u16,
+    ends: [Rc<RefCell<Vec<Arc<WaitQueue>>>>; 2],
 }
 
 #[wasm_bindgen]
 impl WasmLink {
+    /// The network id the router assigned to this link.
+    #[wasm_bindgen(getter, js_name = netId)]
+    pub fn net_id(&self) -> u16 {
+        self.net_id
+    }
+
     pub fn disconnect(&self) {
         self.closer.close();
         for end in &self.ends {
-            *end.borrow_mut() = None;
+            end.borrow_mut().retain(|c| !Arc::ptr_eq(c, &self.closer));
         }
     }
 }
@@ -285,47 +403,54 @@ impl Drop for WasmLink {
     }
 }
 
-/// Set up one side of a link: mark the interface active and spawn the
+/// Set up the edge side of a link: mark the interface active and spawn the
 /// RX/TX workers, all tied to `closer`.
-fn spawn_link_side(
+fn spawn_edge_side(
     stack: EdgeStack,
     reader: duplex::PipeReader,
     writer: duplex::PipeWriter,
     queue: StdQueue,
-    processor: EdgeFrameProcessor,
-    initial_state: InterfaceState,
     closer: Arc<WaitQueue>,
 ) -> Result<(), JsError> {
     stack.manage_profile(|im| {
         match im.interface_state(()) {
             Some(InterfaceState::Down) | None => {}
-            _ => return Err(JsError::new("interface is already in use")),
+            _ => return Err(JsError::new("edge interface is already in use")),
         }
         im.set_closer(closer.clone());
-        im.set_interface_state((), initial_state)
-            .map_err(|e| JsError::new(&format!("failed to set interface state: {e:?}")))?;
+        im.set_interface_state(
+            (),
+            InterfaceState::Active {
+                net_id: 0,
+                node_id: EDGE_NODE_ID,
+            },
+        )
+        .map_err(|e| JsError::new(&format!("failed to set interface state: {e:?}")))?;
         Ok(())
     })?;
 
     let rx_closer = closer.clone();
     spawn_local(async move {
-        let mut rx_worker =
-            RxWorker::new(stack, reader, processor, ()).with_closer(rx_closer.clone());
+        let mut rx_worker = RxWorker::new(stack, reader, EdgeFrameProcessor::new(), ())
+            .with_closer(rx_closer.clone());
         let mut frame = vec![0u8; BUF_SIZE];
         let mut scratch = vec![0u8; BUF_SIZE];
         let _ = rx_worker.run(&mut frame, &mut scratch).await;
         // Ensure the TX worker (and the peer's workers) stop too.
         rx_closer.close();
     });
+    spawn_tx_worker(writer, queue, closer);
 
+    Ok(())
+}
+
+fn spawn_tx_worker(writer: duplex::PipeWriter, queue: StdQueue, closer: Arc<WaitQueue>) {
     spawn_local(async move {
         let consumer = queue.stream_consumer();
         let mut writer = writer;
         let _ = select(tx_worker(&mut writer, consumer), closer.wait()).await;
         closer.close();
     });
-
-    Ok(())
 }
 
 /// Yield to the microtask queue once, letting freshly spawned tasks run.

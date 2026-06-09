@@ -1,36 +1,65 @@
 <script setup lang="ts">
-import { Handle, Position } from '@vue-flow/core'
-
-export type ProfileType = 'root-router' | 'bridge-router' | 'edge'
+import { computed } from 'vue'
+import { Handle, Position, useVueFlow, type Connection } from '@vue-flow/core'
+import { useTopologyStore, type ProfileType } from '@/stores/topology'
 
 export interface ErgotNodeData {
   label: string
   profile: ProfileType
 }
 
-const props = defineProps<{ data: ErgotNodeData }>()
+const props = defineProps<{ id: string; data: ErgotNodeData }>()
+
+const store = useTopologyStore()
+const { updateNodeData } = useVueFlow()
 
 const profileOptions = [
-  { label: 'Root', value: 'root-router' },
-  { label: 'Bridge', value: 'bridge-router' },
+  { label: 'Router', value: 'router' },
   { label: 'Edge', value: 'edge' },
 ]
 
 const profileColors: Record<ProfileType, string> = {
-  'root-router': 'var(--ui-warning)',
-  'bridge-router': 'var(--ui-info)',
+  router: 'var(--ui-warning)',
   edge: 'var(--ui-success)',
 }
 
+const status = computed(() => store.statuses[props.id])
+
+const linked = computed(() => {
+  const s = status.value
+  if (!s) return false
+  return s.profile === 'router' ? s.nets.length > 0 : s.status !== 'down'
+})
+
+const addressLabel = computed(() => {
+  const s = status.value
+  if (!s) return '—'
+  if (s.profile === 'router') {
+    return s.nets.length ? `nets ${s.nets.join(', ')}` : 'no links'
+  }
+  if (s.status === 'active' && s.netId) return `${s.netId}.${s.nodeId}`
+  return s.status
+})
+
 function onProfileChange(value: string) {
-  props.data.profile = value as ProfileType
+  const profile = value as ProfileType
+  store.setProfile(props.id, profile)
+  updateNodeData(props.id, { profile })
 }
+
+const isValidConnection = (conn: Connection) => store.canConnect(conn.source, conn.target)
 </script>
 
 <template>
   <div class="ergot-node">
-    <!-- Upstream handle -->
-    <Handle v-if="data.profile !== 'root-router'" id="top" type="target" :position="Position.Top" />
+    <!-- Uplink handle (edge nodes connect up to a router) -->
+    <Handle
+      v-if="data.profile === 'edge'"
+      id="top"
+      type="target"
+      :position="Position.Top"
+      :is-valid-connection="isValidConnection"
+    />
 
     <div class="flex items-center gap-1 mb-0.5">
       <span
@@ -42,22 +71,31 @@ function onProfileChange(value: string) {
       </span>
     </div>
 
+    <div class="text-[9px] text-(--ui-text-muted) mb-0.5 truncate">{{ addressLabel }}</div>
+
     <USelect
       :model-value="data.profile"
       :items="profileOptions"
+      :disabled="linked"
       size="xs"
       class="w-full"
       @update:model-value="onProfileChange"
     />
 
-    <!-- Downstream handle -->
-    <Handle v-if="data.profile !== 'edge'" id="bottom" type="source" :position="Position.Bottom" />
+    <!-- Downlink handle (routers fan out to edges) -->
+    <Handle
+      v-if="data.profile === 'router'"
+      id="bottom"
+      type="source"
+      :position="Position.Bottom"
+      :is-valid-connection="isValidConnection"
+    />
   </div>
 </template>
 
 <style scoped>
 .ergot-node {
-  width: 100px;
+  width: 110px;
   padding: 4px 6px;
   font-size: 10px;
 }

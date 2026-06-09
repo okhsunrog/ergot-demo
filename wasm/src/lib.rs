@@ -9,6 +9,7 @@ use wasm_bindgen::prelude::*;
 /// "warn", "error". Call once, before creating nodes.
 #[wasm_bindgen(js_name = initLogging)]
 pub fn init_logging(level: &str) -> Result<(), JsError> {
+    console_error_panic_hook::set_once();
     let level = match level {
         "trace" => log::Level::Trace,
         "debug" => log::Level::Debug,
