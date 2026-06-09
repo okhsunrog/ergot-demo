@@ -41,6 +41,8 @@ function wasmHotRebuild(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Served from https://okhsunrog.github.io/ergot-demo/ in CI deploys.
+  base: process.env.GITHUB_ACTIONS ? '/ergot-demo/' : '/',
   staged: {
     '*': 'vp check --fix',
   },
