@@ -174,7 +174,6 @@ function applyImpairment() {
 }
 
 // Ping between the two selected nodes
-const pingResult = ref('')
 const selectedPair = computed(() => {
   const sel = getSelectedNodes.value
   return sel.length === 2 ? sel : null
@@ -186,12 +185,21 @@ async function pingSelected() {
   const [a, b] = pair
   if (!a || !b) return
   const names = `${nodeName(a.data as ErgotNodeData)} → ${nodeName(b.data as ErgotNodeData)}`
-  pingResult.value = `${names}: ...`
   try {
     const res = await store.ping(a.id, b.id)
-    pingResult.value = `${names}: ${res.latencyMs.toFixed(1)} ms`
+    toast.add({
+      title: names,
+      description: `pong in ${res.latencyMs.toFixed(1)} ms`,
+      color: 'success',
+      icon: 'i-lucide-radio',
+    })
   } catch (e) {
-    pingResult.value = `${names}: ${e instanceof Error ? e.message : e}`
+    toast.add({
+      title: names,
+      description: e instanceof Error ? e.message : String(e),
+      color: 'error',
+      icon: 'i-lucide-radio',
+    })
   }
 }
 
@@ -247,7 +255,6 @@ onUnmounted(() => {
           <UButton v-if="selectedPair" variant="outline" icon="i-lucide-radio" @click="pingSelected"
             >Ping</UButton
           >
-          <span v-if="pingResult" class="text-xs text-(--ui-text-muted)">{{ pingResult }}</span>
           <div
             v-if="selectedEdge"
             class="flex items-center gap-1 text-xs text-(--ui-text-muted) border-l border-(--ui-border-muted) pl-2"
