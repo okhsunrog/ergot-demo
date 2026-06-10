@@ -27,6 +27,7 @@ const props = defineProps<{ id: string; data: ErgotNodeData }>()
 
 const store = useTopologyStore()
 const { updateNodeData } = useVueFlow()
+const toast = useToast()
 
 const profileOptions = [
   { label: 'Router', value: 'router' },
@@ -88,13 +89,31 @@ const addressLabel = computed(() => {
 
 function onProfileChange(value: string) {
   const profile = value as ProfileType
-  store.setProfile(props.id, profile, props.data.kind)
+  try {
+    store.setProfile(props.id, profile, props.data.kind)
+  } catch (e) {
+    toast.add({
+      title: 'Cannot change profile',
+      description: e instanceof Error ? e.message : String(e),
+      color: 'error',
+    })
+    return
+  }
   updateNodeData(props.id, { profile })
 }
 
 function onKindChange(value: string) {
   const kind = value as LinkKindType
-  store.setLinkKind(props.id, kind)
+  try {
+    store.setLinkKind(props.id, kind)
+  } catch (e) {
+    toast.add({
+      title: 'Cannot change link kind',
+      description: e instanceof Error ? e.message : String(e),
+      color: 'error',
+    })
+    return
+  }
   updateNodeData(props.id, { kind })
 }
 

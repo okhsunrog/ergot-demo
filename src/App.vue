@@ -108,7 +108,11 @@ function deleteSelected() {
     (e) =>
       selectedEdges.some((s) => s.id === e.id) || nodeIds.has(e.source) || nodeIds.has(e.target),
   )
-  for (const edge of edgesToDrop) store.disconnect(edge.id)
+  for (const edge of edgesToDrop) {
+    store.disconnect(edge.id)
+    store.refresh(edge.source)
+    store.refresh(edge.target)
+  }
   if (edgesToDrop.length) removeEdges(edgesToDrop.map((e) => e.id))
 
   for (const id of nodeIds) store.destroyNode(id)
