@@ -459,3 +459,47 @@ test('bridge: connection validation', () => {
   link.free()
   for (const n of [root, bridge, root2]) n.free()
 })
+
+test('nested bridges: delegated seed leases, unique nets, 3-hop routing', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const b1 = new WasmNode(NodeProfile.Bridge)
+  const b2 = new WasmNode(NodeProfile.Bridge)
+  const edgeTop = new WasmNode(NodeProfile.Edge)
+  const edgeDeep = new WasmNode(NodeProfile.Edge)
+
+  const linkRoot = root.connectTo(edgeTop)
+  const linkRB1 = root.connectTo(b1)
+  const linkB1B2 = b1.connectTo(b2)
+  const linkB2E = b2.connectTo(edgeDeep)
+  await edgeDeep.servePing()
+  await edgeTop.servePing()
+
+  // Kick the chain alive: traffic from the root activates b1's uplink;
+  // each seed task then warms the next level down.
+  await root.ping(linkRB1.netId, 2, 300).catch(() => {})
+
+  await waitFor(() => bridgeStatus(b1).nets.length === 1, 8000)
+  await waitFor(
+    () => bridgeStatus(b2).upstream === 'active' && bridgeStatus(b2).nets.length === 1,
+    8000,
+  )
+  await waitFor(() => (edgeStatus(edgeDeep).netId ?? 0) > 0, 8000)
+
+  // Every net in the tree must be unique: the root owns the whole pool.
+  const rootStatus = root.status()
+  if (rootStatus.profile !== 'router') throw new Error('expected router')
+  const allNets = [...rootStatus.nets, ...bridgeStatus(b1).nets, ...bridgeStatus(b2).nets]
+  expect(new Set(allNets).size).toBe(allNets.length)
+
+  // 3 hops down: root → b1 → b2 → edgeDeep on a delegated net.
+  const deepNet = edgeStatus(edgeDeep).netId!
+  const res = await root.ping(deepNet, 2)
+  expect(res.value).toBe(42)
+
+  // 4 hops across: edgeTop → root → b1 → b2 → edgeDeep.
+  const res2 = await edgeTop.ping(deepNet, 2)
+  expect(res2.value).toBe(42)
+
+  for (const l of [linkB2E, linkB1B2, linkRB1, linkRoot]) l.free()
+  for (const n of [root, b1, b2, edgeTop, edgeDeep]) n.free()
+})
