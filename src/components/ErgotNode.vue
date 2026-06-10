@@ -170,12 +170,7 @@ const name = computed(() => nodeName(props.data))
     </div>
 
     <!-- Downlink handle (routers fan out to edges) -->
-    <Handle
-      v-if="data.profile === 'router'"
-      id="bottom"
-      type="source"
-      :position="Position.Bottom"
-    />
+    <Handle v-if="data.profile !== 'edge'" id="bottom" type="source" :position="Position.Bottom" />
   </div>
 </template>
 
