@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Connection } from '@vue-flow/core'
-import ErgotNode from './components/ErgotNode.vue'
+import ErgotNode, { nodeName, type ErgotNodeData } from './components/ErgotNode.vue'
 import FrameInspector from './components/FrameInspector.vue'
 import HelpModal from './components/HelpModal.vue'
 import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
@@ -38,7 +38,7 @@ function addNode(
     id,
     type: 'ergot',
     position: position ?? project({ x: 250 + Math.random() * 100, y: 150 + Math.random() * 100 }),
-    data: { label: `${profile === 'router' ? 'Router' : 'Node'} ${++nodeSeq}`, profile, kind },
+    data: { seq: ++nodeSeq, profile, kind },
   })
   return id
 }
@@ -115,9 +115,9 @@ const showInspector = ref(true)
 function resolveLink(edgeId: string): string {
   const edge = edges.value.find((e) => e.id === edgeId)
   if (!edge) return edgeId.slice(0, 8)
-  const src = findNode(edge.source)?.data.label ?? edge.source
-  const tgt = findNode(edge.target)?.data.label ?? edge.target
-  return `${src} ⇄ ${tgt}`
+  const srcData = findNode(edge.source)?.data as ErgotNodeData | undefined
+  const tgtData = findNode(edge.target)?.data as ErgotNodeData | undefined
+  return `${srcData ? nodeName(srcData) : edge.source} ⇄ ${tgtData ? nodeName(tgtData) : edge.target}`
 }
 
 function animateActiveEdges() {
@@ -164,12 +164,13 @@ async function pingSelected() {
   if (!pair) return
   const [a, b] = pair
   if (!a || !b) return
-  pingResult.value = `${a.data.label} → ${b.data.label}: ...`
+  const names = `${nodeName(a.data as ErgotNodeData)} → ${nodeName(b.data as ErgotNodeData)}`
+  pingResult.value = `${names}: ...`
   try {
     const res = await store.ping(a.id, b.id)
-    pingResult.value = `${a.data.label} → ${b.data.label}: ${res.latencyMs.toFixed(1)} ms`
+    pingResult.value = `${names}: ${res.latencyMs.toFixed(1)} ms`
   } catch (e) {
-    pingResult.value = `${a.data.label} → ${b.data.label}: ${e instanceof Error ? e.message : e}`
+    pingResult.value = `${names}: ${e instanceof Error ? e.message : e}`
   }
 }
 

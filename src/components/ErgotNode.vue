@@ -1,13 +1,21 @@
-<script setup lang="ts">
-import { computed } from 'vue'
-import { Handle, Position, useVueFlow, type Connection } from '@vue-flow/core'
-import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
+<script lang="ts">
+import type { LinkKindType, ProfileType } from '@/stores/topology'
 
 export interface ErgotNodeData {
-  label: string
+  seq: number
   profile: ProfileType
   kind: LinkKindType
 }
+
+export function nodeName(data: ErgotNodeData): string {
+  return `${data.profile === 'router' ? 'Router' : 'Node'} ${data.seq}`
+}
+</script>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import { Handle, Position, useVueFlow } from '@vue-flow/core'
+import { useTopologyStore } from '@/stores/topology'
 
 const props = defineProps<{ id: string; data: ErgotNodeData }>()
 
@@ -86,19 +94,13 @@ function togglePublish() {
   store.togglePublisher(props.id)
 }
 
-const isValidConnection = (conn: Connection) => store.canConnect(conn.source, conn.target)
+const name = computed(() => nodeName(props.data))
 </script>
 
 <template>
   <div class="ergot-node">
     <!-- Uplink handle (edge nodes connect up to a router) -->
-    <Handle
-      v-if="data.profile === 'edge'"
-      id="top"
-      type="target"
-      :position="Position.Top"
-      :is-valid-connection="isValidConnection"
-    />
+    <Handle v-if="data.profile === 'edge'" id="top" type="target" :position="Position.Top" />
 
     <div class="flex items-center gap-1 mb-0.5">
       <span
@@ -106,7 +108,7 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
         :style="{ background: profileColors[data.profile] }"
       />
       <span class="font-medium text-(--ui-text-highlighted) truncate leading-tight flex-1">
-        {{ data.label }}
+        {{ name }}
       </span>
       <button
         class="publish-toggle"
@@ -165,7 +167,6 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
       id="bottom"
       type="source"
       :position="Position.Bottom"
-      :is-valid-connection="isValidConnection"
     />
   </div>
 </template>
