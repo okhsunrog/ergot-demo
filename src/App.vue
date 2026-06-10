@@ -308,6 +308,15 @@ onUnmounted(() => {
   stroke: var(--ui-primary);
 }
 
+.vue-flow__edge-text {
+  fill: var(--ui-text-muted);
+  font-size: 10px;
+}
+
+.vue-flow__edge-textbg {
+  fill: var(--ui-bg-elevated);
+}
+
 .vue-flow__handle {
   width: 8px;
   height: 8px;
