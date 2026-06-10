@@ -65,11 +65,32 @@ function connectNodes(source: string, target: string): boolean {
   return true
 }
 
+function wouldLoop(source: string, target: string): boolean {
+  // Walk up the parent chain from the source; every node has at most one
+  // uplink, so this terminates. Hitting the target means a ring.
+  const parentOf = new Map(edges.value.map((e) => [e.target, e.source]))
+  let cur: string | undefined = source
+  while (cur) {
+    if (cur === target) return true
+    cur = parentOf.get(cur)
+  }
+  return false
+}
+
 function onConnect(connection: Connection) {
+  if (wouldLoop(connection.source, connection.target)) {
+    toast.add({
+      title: 'Invalid connection',
+      description: 'That link would create a ring with no root router.',
+      color: 'warning',
+    })
+    return
+  }
   if (!store.canConnect(connection.source, connection.target)) {
     toast.add({
       title: 'Invalid connection',
-      description: 'Links go from a router to an unlinked edge node.',
+      description:
+        'Links go from a router/bridge down to a bridge or edge node with a free uplink.',
       color: 'warning',
     })
     return
@@ -213,6 +234,9 @@ onUnmounted(() => {
         <div class="flex gap-2 items-center">
           <UButton icon="i-lucide-router" :disabled="!store.ready" @click="addNode('router')"
             >Add Router</UButton
+          >
+          <UButton icon="i-lucide-git-fork" :disabled="!store.ready" @click="addNode('bridge')"
+            >Add Bridge</UButton
           >
           <UButton icon="i-lucide-plus" :disabled="!store.ready" @click="addNode('edge')"
             >Add Node</UButton

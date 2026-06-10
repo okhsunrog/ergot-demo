@@ -7,8 +7,14 @@ export interface ErgotNodeData {
   kind: LinkKindType
 }
 
+const PROFILE_NAMES: Record<ProfileType, string> = {
+  router: 'Router',
+  bridge: 'Bridge',
+  edge: 'Node',
+}
+
 export function nodeName(data: ErgotNodeData): string {
-  return `${data.profile === 'router' ? 'Router' : 'Node'} ${data.seq}`
+  return `${PROFILE_NAMES[data.profile]} ${data.seq}`
 }
 </script>
 
@@ -24,6 +30,7 @@ const { updateNodeData } = useVueFlow()
 
 const profileOptions = [
   { label: 'Router', value: 'router' },
+  { label: 'Bridge', value: 'bridge' },
   { label: 'Edge', value: 'edge' },
 ]
 
@@ -34,6 +41,7 @@ const kindOptions = [
 
 const profileColors: Record<ProfileType, string> = {
   router: 'var(--ui-warning)',
+  bridge: 'var(--ui-info)',
   edge: 'var(--ui-success)',
 }
 
@@ -62,17 +70,17 @@ const sparkline = computed(() => {
     .join(' ')
 })
 
-const linked = computed(() => {
-  const s = status.value
-  if (!s) return false
-  return s.profile === 'router' ? s.nets.length > 0 : s.status !== 'down'
-})
+const linked = computed(() => (store.linkCounts[props.id] ?? 0) > 0)
 
 const addressLabel = computed(() => {
   const s = status.value
   if (!s) return '—'
   if (s.profile === 'router') {
     return s.nets.length ? `nets ${s.nets.join(', ')}` : 'no links'
+  }
+  if (s.profile === 'bridge') {
+    const up = s.upstream === 'active' && s.upstreamNetId ? `up ${s.upstreamNetId}.2` : 'no uplink'
+    return s.nets.length ? `${up} · nets ${s.nets.join(', ')}` : up
   }
   if (s.status === 'active' && s.netId) return `${s.netId}.${s.nodeId}`
   return s.status
@@ -100,7 +108,7 @@ const name = computed(() => nodeName(props.data))
 <template>
   <div class="ergot-node">
     <!-- Uplink handle (edge nodes connect up to a router) -->
-    <Handle v-if="data.profile === 'edge'" id="top" type="target" :position="Position.Top" />
+    <Handle v-if="data.profile !== 'router'" id="top" type="target" :position="Position.Top" />
 
     <div class="flex items-center gap-1 mb-0.5">
       <span
@@ -144,7 +152,7 @@ const name = computed(() => nodeName(props.data))
     </div>
 
     <div
-      v-if="data.profile === 'edge'"
+      v-if="data.profile !== 'router'"
       :title="
         linked
           ? 'Disconnect the node to change its uplink transport'

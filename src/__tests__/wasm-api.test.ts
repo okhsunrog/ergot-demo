@@ -174,11 +174,11 @@ test('connection validation', () => {
   const edge = new WasmNode(NodeProfile.Edge)
   const edge2 = new WasmNode(NodeProfile.Edge)
 
-  expect(() => edge.connectTo(edge2)).toThrow(/router\.connectTo/)
-  expect(() => router.connectTo(router2)).toThrow(/must be an edge/)
+  expect(() => edge.connectTo(edge2)).toThrow(/router or bridge/)
+  expect(() => router.connectTo(router2)).toThrow(/must be a bridge or edge/)
 
   const link = router.connectTo(edge)
-  expect(() => router2.connectTo(edge)).toThrow(/already linked/)
+  expect(() => router2.connectTo(edge)).toThrow(/already linked upstream/)
 
   link.free()
   for (const n of [router, router2, edge, edge2]) n.free()
@@ -369,4 +369,93 @@ test('periodic publisher streams and full loss starves a subscriber', async () =
   linkPub.free()
   linkSub.free()
   for (const n of [router, pub, sub]) n.free()
+})
+
+async function waitFor(cond: () => boolean, ms = 4000) {
+  const t0 = Date.now()
+  while (!cond()) {
+    if (Date.now() - t0 > ms) throw new Error('waitFor timed out')
+    await sleep(50)
+  }
+}
+
+function bridgeStatus(node: WasmNode) {
+  const status = node.status()
+  if (status.profile !== 'bridge') throw new Error('expected a bridge node')
+  return status
+}
+
+test('bridge: seed lease arrives and traffic routes root → bridge → edge', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const bridge = new WasmNode(NodeProfile.Bridge)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const linkRB = root.connectTo(bridge)
+  const linkBE = bridge.connectTo(edge)
+  expect(linkBE.netId).toBe(0) // pending until seed assignment
+  await edge.servePing()
+
+  // Any frame from the root activates the bridge uplink; the seed task
+  // then leases a net for the pending downlink and warms it.
+  await root.ping(linkRB.netId, 2, 300).catch(() => {})
+  await waitFor(() => {
+    const st = bridge.status()
+    return st.profile === 'bridge' && st.upstream === 'active' && st.nets.length === 1
+  })
+  await waitFor(() => {
+    const st = edgeStatus(edge)
+    return st.status === 'active' && (st.netId ?? 0) > 0
+  })
+
+  const seedNet = edgeStatus(edge).netId!
+  expect(bridgeStatus(bridge).nets).toEqual([seedNet])
+  expect(seedNet).not.toBe(linkRB.netId)
+
+  // Multi-hop across the bridge using the globally routed seed net.
+  const res = await root.ping(seedNet, 2)
+  expect(res.value).toBe(42)
+
+  linkBE.free()
+  linkRB.free()
+  for (const n of [root, bridge, edge]) n.free()
+})
+
+test('bridge: orphan subtree gets its lease once the uplink appears', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const bridge = new WasmNode(NodeProfile.Bridge)
+  const edge = new WasmNode(NodeProfile.Edge)
+  // Downlink first: stays pending with no upstream.
+  const linkBE = bridge.connectTo(edge)
+  await edge.servePing()
+  await sleep(200)
+  expect(bridgeStatus(bridge).nets).toEqual([])
+
+  // Now attach the uplink: the pending downlink gets its lease.
+  const linkRB = root.connectTo(bridge)
+  await root.ping(linkRB.netId, 2, 300).catch(() => {})
+  await waitFor(() => bridgeStatus(bridge).nets.length === 1)
+  await waitFor(() => (edgeStatus(edge).netId ?? 0) > 0)
+
+  const res = await root.ping(edgeStatus(edge).netId!, 2)
+  expect(res.value).toBe(42)
+
+  linkBE.free()
+  linkRB.free()
+  for (const n of [root, bridge, edge]) n.free()
+})
+
+test('bridge: connection validation', () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const bridge = new WasmNode(NodeProfile.Bridge)
+  const root2 = new WasmNode(NodeProfile.Router)
+
+  expect(root.uplinkFree).toBe(false)
+  expect(bridge.uplinkFree).toBe(true)
+  expect(() => root.connectTo(root2)).toThrow(/must be a bridge or edge/)
+
+  const link = root.connectTo(bridge)
+  expect(bridge.uplinkFree).toBe(false)
+  expect(() => root2.connectTo(bridge)).toThrow(/already linked upstream/)
+
+  link.free()
+  for (const n of [root, bridge, root2]) n.free()
 })

@@ -25,6 +25,9 @@ Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 - **Real routing**: each downlink gets its own network id from the Router
   profile; multi-hop edge → router → edge traffic works, addresses appear
   on node cards as edges learn them.
+- **Bridge routers**: router ↔ bridge ↔ edge hierarchies with live
+  seed-router net assignment — a bridge's downlinks stay pending until its
+  uplink activates, then lease globally routed network ids from upstream.
 - **Endpoints**: well-known ping with measured RTT between any two selected
   nodes.
 - **Topics (pub/sub)**: nodes publish a sensor stream (broadcast or unicast);
@@ -46,9 +49,9 @@ Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
   transport) for wireless devices.
 - **WebUSB**: bulk-endpoint transport in the spirit of ergot's `nusb` host
   support, for USB devices without a serial CDC interface.
-- **Bridge routers**: router↔router links with live seed-router net
-  assignment, leases, and refresh — ergot's most distinctive mechanism,
-  watchable on the canvas.
+- **Lease refresh & expiry**: bridges currently take a seed lease once;
+  refreshing it (and watching leases expire under impairment) is not wired
+  up yet.
 - **Discovery panel**: `discover()` + `DeviceInfo` from any node, once
   ergot's discovery is freed from its tokio-only timeout (same
   sleeper-injection treatment the RX workers already got on the

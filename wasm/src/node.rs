@@ -40,7 +40,7 @@ use ergot::{
         Interface, InterfaceSink, InterfaceState, Profile,
         profiles::{
             direct_edge::{DirectEdge, EDGE_NODE_ID, EdgeFrameProcessor},
-            router::{Router, RouterFrameProcessor},
+            router::{Router, RouterFrameProcessor, UPSTREAM_IDENT},
         },
         transports::{
             futures_io::{RxWorker, tx_worker},
@@ -51,7 +51,7 @@ use ergot::{
             std::{StdQueue, new_std_queue},
         },
     },
-    net_stack::ArcNetStack,
+    net_stack::{ArcNetStack, services::bridge_seed_assign},
     well_known::ErgotPingEndpoint,
 };
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
@@ -236,6 +236,8 @@ type RouterStack = ArcNetStack<
 
 enum Stack {
     Router(RouterStack),
+    /// Router profile in bridge mode; `queue` feeds the upstream sink.
+    Bridge { stack: RouterStack, queue: StdQueue },
     Edge { stack: EdgeStack, queue: StdQueue },
 }
 
@@ -291,6 +293,9 @@ impl PacketSender for ChannelTx {
 pub enum NodeProfile {
     /// Router profile: many downlinks, each assigned its own network id.
     Router,
+    /// Router profile in bridge mode: one uplink, downlinks get network ids
+    /// leased from the upstream seed router.
+    Bridge,
     /// DirectEdge target: a single uplink to a router.
     Edge,
 }
@@ -323,6 +328,12 @@ pub struct PingResult {
 pub enum NodeStatus {
     /// Router: the network ids of its active downlinks.
     Router { nets: Vec<u16> },
+    /// Bridge: uplink state plus the seed-leased downlink network ids.
+    Bridge {
+        upstream: String,
+        upstream_net_id: Option<u16>,
+        nets: Vec<u16>,
+    },
     /// Edge: the state of its single uplink.
     Edge {
         status: String,
@@ -365,8 +376,8 @@ pub struct WasmNode {
     services_closer: Arc<WaitQueue>,
     /// Closers of currently attached links. Shared with [`WasmLink`]s.
     links: Rc<RefCell<Vec<Arc<WaitQueue>>>>,
-    /// Edge nodes: the frame-tap label of the uplink sink, set while linked.
-    edge_tap_label: Rc<RefCell<Option<String>>>,
+    /// Edge/bridge nodes: the frame-tap label of the uplink sink, set while linked.
+    uplink_tap_label: Rc<RefCell<Option<String>>>,
     /// Sensor readings received by the subscriber task.
     samples: Rc<RefCell<VecDeque<SensorSample>>>,
     /// Closer of the running sensor publisher task, if any.
@@ -380,10 +391,26 @@ impl WasmNode {
     #[wasm_bindgen(constructor)]
     pub fn new(profile: NodeProfile, link_kind: Option<LinkKind>) -> WasmNode {
         let link_kind = link_kind.unwrap_or(LinkKind::Stream);
-        let edge_tap_label = Rc::new(RefCell::new(None));
+        let uplink_tap_label = Rc::new(RefCell::new(None));
+        let services_closer = Arc::new(WaitQueue::new());
         let stack = match profile {
             NodeProfile::Router => {
                 Stack::Router(RouterStack::new_with_profile(Router::new_std()))
+            }
+            NodeProfile::Bridge => {
+                let queue = new_std_queue(QUEUE_SIZE);
+                let sink = new_sink(
+                    link_kind,
+                    &queue,
+                    Tap {
+                        label: uplink_tap_label.clone(),
+                        dir: "up",
+                    },
+                );
+                Stack::Bridge {
+                    stack: RouterStack::new_with_profile(Router::new_bridge_std(sink)),
+                    queue,
+                }
             }
             NodeProfile::Edge => {
                 let queue = new_std_queue(QUEUE_SIZE);
@@ -391,7 +418,7 @@ impl WasmNode {
                     link_kind,
                     &queue,
                     Tap {
-                        label: edge_tap_label.clone(),
+                        label: uplink_tap_label.clone(),
                         dir: "up",
                     },
                 );
@@ -401,13 +428,26 @@ impl WasmNode {
                 }
             }
         };
+        // Router-profile nodes answer seed-router assignment requests from
+        // bridges below them.
+        if let Stack::Router(stack) | Stack::Bridge { stack, .. } = &stack {
+            let stack = stack.clone();
+            let closer = services_closer.clone();
+            spawn_local(async move {
+                let _ = select(
+                    stack.services().seed_router_request_handler::<4>(),
+                    closer.wait(),
+                )
+                .await;
+            });
+        }
         WasmNode {
             stack,
             profile,
             link_kind,
-            services_closer: Arc::new(WaitQueue::new()),
+            services_closer,
             links: Rc::new(RefCell::new(Vec::new())),
-            edge_tap_label,
+            uplink_tap_label,
             samples: Rc::new(RefCell::new(VecDeque::new())),
             publisher_closer: RefCell::new(None),
         }
@@ -430,12 +470,49 @@ impl WasmNode {
         self.links.borrow().len()
     }
 
+    /// Can this node accept a new uplink? (Routers have none.)
+    #[wasm_bindgen(getter, js_name = uplinkFree)]
+    pub fn uplink_free(&self) -> bool {
+        match &self.stack {
+            Stack::Router(_) => false,
+            Stack::Bridge { stack, .. } => stack.manage_profile(|im| {
+                matches!(
+                    im.interface_state(UPSTREAM_IDENT),
+                    Some(InterfaceState::Down) | None
+                )
+            }),
+            Stack::Edge { stack, .. } => stack.manage_profile(|im| {
+                matches!(
+                    im.interface_state(()),
+                    Some(InterfaceState::Down) | None
+                )
+            }),
+        }
+    }
+
     /// Current state of the node (router downlink nets / edge uplink state).
     pub fn status(&self) -> NodeStatus {
         match &self.stack {
             Stack::Router(stack) => NodeStatus::Router {
                 nets: stack.manage_profile(|im| im.get_nets()),
             },
+            Stack::Bridge { stack, .. } => {
+                let (state, mut nets) =
+                    stack.manage_profile(|im| (im.interface_state(UPSTREAM_IDENT), im.get_nets()));
+                let (upstream, upstream_net_id) = match state {
+                    Some(InterfaceState::Active { net_id, .. }) => ("active", Some(net_id)),
+                    Some(InterfaceState::Inactive) => ("inactive", None),
+                    _ => ("down", None),
+                };
+                if let Some(up) = upstream_net_id {
+                    nets.retain(|n| *n != up);
+                }
+                NodeStatus::Bridge {
+                    upstream: upstream.into(),
+                    upstream_net_id,
+                    nets,
+                }
+            }
             Stack::Edge { stack, .. } => {
                 let state = stack.manage_profile(|im| im.interface_state(()));
                 match state {
@@ -459,130 +536,160 @@ impl WasmNode {
         }
     }
 
-    /// Connect this node (router) to an edge node, using the edge's link
-    /// kind. The router assigns the link its own network id. `link_id` is an
-    /// opaque label (e.g. the canvas edge id) attached to tapped frames.
+    /// Connect this node (router or bridge: downlink side) to a bridge or
+    /// edge node (uplink side), using the child's link kind. Routers assign
+    /// the link a network id from their own pool; bridge downlinks lease one
+    /// from the upstream seed router once their uplink is active. `link_id`
+    /// is an opaque label (e.g. the canvas edge id) attached to tapped frames.
     #[wasm_bindgen(js_name = connectTo)]
     pub fn connect_to(&self, target: &WasmNode, link_id: Option<String>) -> Result<WasmLink, JsError> {
-        let Stack::Router(router) = &self.stack else {
-            return Err(JsError::new(
-                "connectTo must be called as router.connectTo(edge)",
-            ));
+        let parent = match &self.stack {
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => stack,
+            Stack::Edge { .. } => {
+                return Err(JsError::new(
+                    "connectTo must be called on a router or bridge (the downlink side)",
+                ));
+            }
         };
-        let Stack::Edge {
-            stack: edge,
-            queue: edge_queue,
-        } = &target.stack
-        else {
+        let parent_is_bridge = self.profile == NodeProfile::Bridge;
+        if matches!(target.stack, Stack::Router(_)) {
             return Err(JsError::new(
-                "connectTo target must be an edge node (router-to-router links are not supported yet)",
+                "connectTo target must be a bridge or edge node (routers have no uplink)",
             ));
-        };
-        if !target.links.borrow().is_empty() {
-            return Err(JsError::new("edge node is already linked"));
+        }
+        if !target.uplink_free() {
+            return Err(JsError::new("target node is already linked upstream"));
         }
         let kind = target.link_kind;
 
         let closer = Arc::new(WaitQueue::new());
         let impairment = Impairment::default();
-        let router_tap_label = Rc::new(RefCell::new(link_id.clone()));
-        *target.edge_tap_label.borrow_mut() = link_id;
+        let parent_tap_label = Rc::new(RefCell::new(link_id.clone()));
+        *target.uplink_tap_label.borrow_mut() = link_id;
 
-        // Router side: register a new interface; the profile assigns a net id.
-        let router_queue = new_std_queue(QUEUE_SIZE);
-        let res = router.manage_profile(|im| {
-            let ident = im
-                .register_interface(new_sink(
-                    kind,
-                    &router_queue,
-                    Tap {
-                        label: router_tap_label.clone(),
-                        dir: "down",
-                    },
-                ))
-                .ok()?;
+        // Parent side: register a downlink interface. Routers assign a net id
+        // immediately; bridge downlinks start pending until seed assignment.
+        let parent_queue = new_std_queue(QUEUE_SIZE);
+        let res = parent.manage_profile(|im| {
+            let sink = new_sink(
+                kind,
+                &parent_queue,
+                Tap {
+                    label: parent_tap_label.clone(),
+                    dir: "down",
+                },
+            );
+            let ident = if parent_is_bridge {
+                im.register_interface_pending(sink).ok()?
+            } else {
+                im.register_interface(sink).ok()?
+            };
+            let net_id = im.net_id_of(ident).unwrap_or(0);
             let state = im.interface_state(ident)?;
-            let net_id = im.net_id_of(ident)?;
             im.set_interface_closer(ident, closer.clone());
             Some((ident, net_id, state))
         });
-        let Some((ident, net_id, router_state)) = res else {
-            return Err(JsError::new("router has no free interface slots"));
+        let Some((ident, net_id, parent_state)) = res else {
+            return Err(JsError::new("parent has no free interface slots"));
         };
 
-        // Edge side: validate and mark the single uplink active.
-        let edge_state = InterfaceState::Active {
-            net_id: 0,
-            node_id: EDGE_NODE_ID,
+        // Child side: mark the uplink interface up.
+        let child_setup = match &target.stack {
+            Stack::Edge { stack, .. } => stack.manage_profile(|im| {
+                im.set_closer(closer.clone());
+                im.set_interface_state(
+                    (),
+                    InterfaceState::Active {
+                        net_id: 0,
+                        node_id: EDGE_NODE_ID,
+                    },
+                )
+                .map_err(|e| JsError::new(&format!("failed to set interface state: {e:?}")))
+            }),
+            Stack::Bridge { stack, .. } => stack.manage_profile(|im| {
+                im.set_interface_closer(UPSTREAM_IDENT, closer.clone());
+                // The bridge upstream starts Inactive and discovers its net id
+                // from the first frame the parent sends.
+                im.set_interface_state(UPSTREAM_IDENT, InterfaceState::Inactive)
+                    .map_err(|e| JsError::new(&format!("failed to set upstream state: {e:?}")))
+            }),
+            Stack::Router(_) => unreachable!("validated above"),
         };
-        let edge_setup = edge.manage_profile(|im| {
-            match im.interface_state(()) {
-                Some(InterfaceState::Down) | None => {}
-                _ => return Err(JsError::new("edge interface is already in use")),
-            }
-            im.set_closer(closer.clone());
-            im.set_interface_state((), edge_state)
-                .map_err(|e| JsError::new(&format!("failed to set interface state: {e:?}")))?;
-            Ok(())
-        });
-        if let Err(e) = edge_setup {
+        let child_state = match &target.stack {
+            Stack::Edge { .. } => InterfaceState::Active {
+                net_id: 0,
+                node_id: EDGE_NODE_ID,
+            },
+            _ => InterfaceState::Inactive,
+        };
+        if let Err(e) = child_setup {
             closer.close();
-            *target.edge_tap_label.borrow_mut() = None;
-            router.manage_profile(|im| {
+            *target.uplink_tap_label.borrow_mut() = None;
+            parent.manage_profile(|im| {
                 let _ = im.deregister_interface(ident);
             });
             return Err(e);
         }
 
+        let parent_rx = StackSide::RouterDown(parent.clone(), ident, net_id);
+        let child_rx = match &target.stack {
+            Stack::Edge { stack, .. } => StackSide::Edge(stack.clone()),
+            Stack::Bridge { stack, .. } => StackSide::BridgeUp(stack.clone()),
+            Stack::Router(_) => unreachable!("validated above"),
+        };
+        let child_queue = match &target.stack {
+            Stack::Edge { queue, .. } | Stack::Bridge { queue, .. } => queue.clone(),
+            Stack::Router(_) => unreachable!("validated above"),
+        };
+
         match kind {
             LinkKind::Stream => {
                 // Per direction: tx → pipe a → impairment forwarder → pipe b → rx.
-                let (router_writer, down_tap) = duplex::pipe();
-                let (down_out, edge_reader) = duplex::pipe();
-                let (edge_writer, up_tap) = duplex::pipe();
-                let (up_out, router_reader) = duplex::pipe();
+                let (parent_writer, down_tap) = duplex::pipe();
+                let (down_out, child_reader) = duplex::pipe();
+                let (child_writer, up_tap) = duplex::pipe();
+                let (up_out, parent_reader) = duplex::pipe();
                 spawn_stream_impairment(down_tap, down_out, impairment.clone(), closer.clone());
                 spawn_stream_impairment(up_tap, up_out, impairment.clone(), closer.clone());
 
-                spawn_stream_rx(
-                    StreamRxSide::Router(router.clone(), ident, net_id),
-                    router_reader,
-                    closer.clone(),
-                );
-                spawn_stream_tx(router_writer, router_queue.clone(), closer.clone());
-                spawn_stream_rx(
-                    StreamRxSide::Edge(edge.clone()),
-                    edge_reader,
-                    closer.clone(),
-                );
-                spawn_stream_tx(edge_writer, edge_queue.clone(), closer.clone());
+                spawn_stream_rx(parent_rx, parent_reader, closer.clone());
+                spawn_stream_tx(parent_writer, parent_queue.clone(), closer.clone());
+                spawn_stream_rx(child_rx, child_reader, closer.clone());
+                spawn_stream_tx(child_writer, child_queue, closer.clone());
             }
             LinkKind::Packet => {
                 // Per direction: worker → channel a → impairment forwarder → channel b → worker.
-                let (router_tx, down_tap) = unbounded();
-                let (down_out, edge_rx) = unbounded();
-                let (edge_tx, up_tap) = unbounded();
-                let (up_out, router_rx) = unbounded();
+                let (parent_tx, down_tap) = unbounded();
+                let (down_out, child_chan_rx) = unbounded();
+                let (child_tx, up_tap) = unbounded();
+                let (up_out, parent_chan_rx) = unbounded();
                 spawn_packet_impairment(down_tap, down_out, impairment.clone(), closer.clone());
                 spawn_packet_impairment(up_tap, up_out, impairment.clone(), closer.clone());
 
                 spawn_packet_worker(
-                    PacketSide::Router(router.clone(), ident),
-                    router_rx,
-                    router_tx_half(router_tx),
-                    router_queue.clone(),
-                    router_state,
+                    parent_rx,
+                    parent_chan_rx,
+                    router_tx_half(parent_tx),
+                    parent_queue.clone(),
+                    parent_state,
                     closer.clone(),
                 );
                 spawn_packet_worker(
-                    PacketSide::Edge(edge.clone()),
-                    edge_rx,
-                    router_tx_half(edge_tx),
-                    edge_queue.clone(),
-                    edge_state,
+                    child_rx,
+                    child_chan_rx,
+                    router_tx_half(child_tx),
+                    child_queue,
+                    child_state,
                     closer.clone(),
                 );
             }
+        }
+
+        // Bridge downlinks: lease a net id from the upstream seed router as
+        // soon as the uplink is active, then warm the new net with one ping
+        // so the child learns its address.
+        if parent_is_bridge {
+            spawn_seed_assign(parent.clone(), ident, closer.clone());
         }
 
         self.links.borrow_mut().push(closer.clone());
@@ -593,7 +700,7 @@ impl WasmNode {
             net_id,
             kind,
             ends: [self.links.clone(), target.links.clone()],
-            tap_labels: [router_tap_label, target.edge_tap_label.clone()],
+            tap_labels: [parent_tap_label, target.uplink_tap_label.clone()],
             impairment,
         })
     }
@@ -605,7 +712,7 @@ impl WasmNode {
     pub async fn serve_ping(&self) {
         let closer = self.services_closer.clone();
         match &self.stack {
-            Stack::Router(stack) => {
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => {
                 let stack = stack.clone();
                 spawn_local(async move {
                     let server = stack
@@ -670,7 +777,7 @@ impl WasmNode {
         let start = js_sys::Date::now();
         let req = async {
             match &self.stack {
-                Stack::Router(stack) => {
+                Stack::Router(stack) | Stack::Bridge { stack, .. } => {
                     stack
                         .endpoints()
                         .request::<ErgotPingEndpoint>(addr, &42u32, Some("ping"))
@@ -701,7 +808,7 @@ impl WasmNode {
         let closer = self.services_closer.clone();
         let samples = self.samples.clone();
         match &self.stack {
-            Stack::Router(stack) => {
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => {
                 let stack = stack.clone();
                 spawn_local(async move {
                     let recv = stack.topics().bounded_receiver::<SensorTopic, 16>(None);
@@ -747,7 +854,9 @@ impl WasmNode {
     #[wasm_bindgen(js_name = publishSensor)]
     pub fn publish_sensor(&self, value: f32) -> Result<(), JsError> {
         let res = match &self.stack {
-            Stack::Router(stack) => stack.topics().broadcast::<SensorTopic>(&value, None),
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => {
+                stack.topics().broadcast::<SensorTopic>(&value, None)
+            }
             Stack::Edge { stack, .. } => stack.topics().broadcast::<SensorTopic>(&value, None),
         };
         res.map_err(|e| JsError::new(&format!("publish failed: {e:?}")))
@@ -767,7 +876,9 @@ impl WasmNode {
             port_id: 0,
         };
         let res = match &self.stack {
-            Stack::Router(stack) => stack.topics().unicast::<SensorTopic>(dest, &value),
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => {
+                stack.topics().unicast::<SensorTopic>(dest, &value)
+            }
             Stack::Edge { stack, .. } => stack.topics().unicast::<SensorTopic>(dest, &value),
         };
         res.map_err(|e| JsError::new(&format!("publish failed: {e:?}")))
@@ -800,7 +911,7 @@ impl WasmNode {
             }};
         }
         match &self.stack {
-            Stack::Router(stack) => run_publisher!(stack),
+            Stack::Router(stack) | Stack::Bridge { stack, .. } => run_publisher!(stack),
             Stack::Edge { stack, .. } => run_publisher!(stack),
         }
     }
@@ -915,17 +1026,22 @@ fn router_tx_half(tx: UnboundedSender<Vec<u8>>) -> ChannelTx {
     ChannelTx { tx }
 }
 
-enum StreamRxSide {
-    Router(RouterStack, u8, u16),
+/// One side of a link, for transport worker spawning.
+enum StackSide {
+    /// Parent downlink on a router-profile stack (router or bridge).
+    RouterDown(RouterStack, u8, u16),
+    /// Bridge uplink (UPSTREAM_IDENT, edge-style frame processing).
+    BridgeUp(RouterStack),
+    /// Edge uplink.
     Edge(EdgeStack),
 }
 
-fn spawn_stream_rx(side: StreamRxSide, reader: duplex::PipeReader, closer: Arc<WaitQueue>) {
+fn spawn_stream_rx(side: StackSide, reader: duplex::PipeReader, closer: Arc<WaitQueue>) {
     spawn_local(async move {
         let mut frame = vec![0u8; BUF_SIZE];
         let mut scratch = vec![0u8; BUF_SIZE];
         match side {
-            StreamRxSide::Router(stack, ident, net_id) => {
+            StackSide::RouterDown(stack, ident, net_id) => {
                 let mut rx_worker = RxWorker::new(
                     stack.clone(),
                     reader,
@@ -940,7 +1056,14 @@ fn spawn_stream_rx(side: StreamRxSide, reader: duplex::PipeReader, closer: Arc<W
                     let _ = im.deregister_interface(ident);
                 });
             }
-            StreamRxSide::Edge(stack) => {
+            StackSide::BridgeUp(stack) => {
+                let mut rx_worker =
+                    RxWorker::new(stack, reader, EdgeFrameProcessor::new(), UPSTREAM_IDENT)
+                        .with_closer(closer.clone());
+                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                closer.close();
+            }
+            StackSide::Edge(stack) => {
                 let mut rx_worker = RxWorker::new(stack, reader, EdgeFrameProcessor::new(), ())
                     .with_closer(closer.clone());
                 let _ = rx_worker.run(&mut frame, &mut scratch).await;
@@ -959,13 +1082,8 @@ fn spawn_stream_tx(writer: duplex::PipeWriter, queue: StdQueue, closer: Arc<Wait
     });
 }
 
-enum PacketSide {
-    Router(RouterStack, u8),
-    Edge(EdgeStack),
-}
-
 fn spawn_packet_worker(
-    side: PacketSide,
+    side: StackSide,
     rx: UnboundedReceiver<Vec<u8>>,
     tx: ChannelTx,
     queue: StdQueue,
@@ -980,14 +1098,12 @@ fn spawn_packet_worker(
         let consumer = queue.framed_consumer();
         let mut scratch = vec![0u8; BUF_SIZE];
         match side {
-            PacketSide::Router(stack, ident) => {
+            StackSide::RouterDown(stack, ident, net_id) => {
                 let mut worker = PacketRxTxWorker::new(
                     stack.clone(),
                     receiver,
                     tx,
-                    RouterFrameProcessor::new(
-                        stack.manage_profile(|im| im.net_id_of(ident)).unwrap_or(0),
-                    ),
+                    RouterFrameProcessor::new(net_id),
                     ident,
                     consumer,
                 );
@@ -998,7 +1114,19 @@ fn spawn_packet_worker(
                     let _ = im.deregister_interface(ident);
                 });
             }
-            PacketSide::Edge(stack) => {
+            StackSide::BridgeUp(stack) => {
+                let mut worker = PacketRxTxWorker::new(
+                    stack,
+                    receiver,
+                    tx,
+                    EdgeFrameProcessor::new(),
+                    UPSTREAM_IDENT,
+                    consumer,
+                );
+                let _ = worker.run(initial_state, &mut scratch).await;
+                closer.close();
+            }
+            StackSide::Edge(stack) => {
                 let mut worker = PacketRxTxWorker::new(
                     stack,
                     receiver,
@@ -1009,6 +1137,48 @@ fn spawn_packet_worker(
                 );
                 let _ = worker.run(initial_state, &mut scratch).await;
                 closer.close();
+            }
+        }
+    });
+}
+
+/// Lease a network id for a pending bridge downlink as soon as the bridge's
+/// uplink becomes active, then warm the new net with one ping so the child
+/// learns its address. Retries until it succeeds or the link closes.
+fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQueue>) {
+    spawn_local(async move {
+        loop {
+            if let Either::Second(_) = select(TimeoutFuture::new(150), closer.wait()).await {
+                return;
+            }
+            let upstream_active = stack.manage_profile(|im| {
+                matches!(
+                    im.interface_state(UPSTREAM_IDENT),
+                    Some(InterfaceState::Active { .. })
+                )
+            });
+            if !upstream_active {
+                continue;
+            }
+            match bridge_seed_assign(&stack, UPSTREAM_IDENT, ident).await {
+                Ok(lease) => {
+                    let addr = Address {
+                        network_id: lease.net_id,
+                        node_id: EDGE_NODE_ID,
+                        port_id: 0,
+                    };
+                    let warm = async {
+                        let _ = stack
+                            .endpoints()
+                            .request::<ErgotPingEndpoint>(addr, &0u32, Some("ping"))
+                            .await;
+                    };
+                    let _ = select(warm, TimeoutFuture::new(300)).await;
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("seed assignment failed (will retry): {e:?}");
+                }
             }
         }
     });

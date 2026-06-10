@@ -35,9 +35,14 @@ const open = defineModel<boolean>('open', { required: true })
             addresses, kind, sequence numbers.
           </li>
           <li>
-            <b>Rewire:</b> drag from a router's bottom handle to a node's top handle. An edge node
-            takes one uplink; its transport (COBS byte stream vs packet) is selectable while
+            <b>Rewire:</b> drag from a router's bottom handle to a node's top handle. Uplinked nodes
+            take one uplink; the transport (COBS byte stream vs packet) is selectable while
             unlinked.
+          </li>
+          <li>
+            <b>Bridge:</b> add a Bridge between a router and its nodes — watch it lease network ids
+            for its downlinks from the upstream seed router (the <b>nets</b> on its card appear only
+            after its uplink comes alive).
           </li>
         </ul>
         <p class="text-(--ui-text-muted)">

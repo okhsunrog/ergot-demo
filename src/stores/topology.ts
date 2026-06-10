@@ -12,7 +12,7 @@ import init, {
   type PingResult,
 } from '../wasm-pkg/ergot_demo_wasm'
 
-export type ProfileType = 'router' | 'edge'
+export type ProfileType = 'router' | 'bridge' | 'edge'
 export type LinkKindType = 'stream' | 'packet'
 
 // WASM handles are plain pointers — keep them out of Vue's reactivity.
@@ -20,7 +20,9 @@ const nodeHandles = new Map<string, WasmNode>()
 const linkHandles = new Map<string, WasmLink>()
 
 function toWasmProfile(profile: ProfileType): NodeProfile {
-  return profile === 'router' ? NodeProfile.Router : NodeProfile.Edge
+  if (profile === 'router') return NodeProfile.Router
+  if (profile === 'bridge') return NodeProfile.Bridge
+  return NodeProfile.Edge
 }
 
 function toWasmLinkKind(kind: LinkKindType): LinkKind {
@@ -37,6 +39,8 @@ const MAX_FRAMES = 100
 export const useTopologyStore = defineStore('topology', () => {
   const ready = ref(false)
   const statuses = reactive<Record<string, NodeStatus>>({})
+  /** Attached-link counts per node id (drives UI locking of selects). */
+  const linkCounts = reactive<Record<string, number>>({})
   /** Recent tapped frames, newest last. */
   const frames = ref<FrameEvent[]>([])
   /** Last frame timestamp per canvas edge id, for edge activity animation. */
@@ -55,7 +59,9 @@ export const useTopologyStore = defineStore('topology', () => {
 
   function refresh(id: string) {
     const handle = nodeHandles.get(id)
-    if (handle) statuses[id] = handle.status()
+    if (!handle) return
+    statuses[id] = handle.status()
+    linkCounts[id] = handle.linkCount
   }
 
   function refreshAll() {
@@ -117,6 +123,7 @@ export const useTopologyStore = defineStore('topology', () => {
     nodeHandles.get(id)?.free()
     nodeHandles.delete(id)
     delete statuses[id]
+    delete linkCounts[id]
     delete sensorData[id]
     delete publishing[id]
   }
@@ -128,9 +135,9 @@ export const useTopologyStore = defineStore('topology', () => {
     return (
       source !== undefined &&
       target !== undefined &&
-      source.profile === NodeProfile.Router &&
-      target.profile === NodeProfile.Edge &&
-      target.linkCount === 0
+      source.profile !== NodeProfile.Edge &&
+      target.profile !== NodeProfile.Router &&
+      target.uplinkFree
     )
   }
 
@@ -142,14 +149,17 @@ export const useTopologyStore = defineStore('topology', () => {
     if (!source || !target) throw new Error('unknown node')
     const link = source.connectTo(target, edgeId)
     linkHandles.set(edgeId, link)
-    // Warm the link with one ping so the edge node learns its address.
-    void source
-      .ping(link.netId, 2, 500)
-      .catch(() => {})
-      .then(() => {
-        refresh(sourceId)
-        refresh(targetId)
-      })
+    // Warm the link with one ping so the child learns its address. Pending
+    // bridge downlinks (netId 0) warm themselves after seed assignment.
+    if (link.netId > 0) {
+      void source
+        .ping(link.netId, 2, 500)
+        .catch(() => {})
+        .then(() => {
+          refresh(sourceId)
+          refresh(targetId)
+        })
+    }
     refresh(sourceId)
     refresh(targetId)
     return link.kind === LinkKind.Packet ? 'packet' : 'stream'
@@ -169,14 +179,14 @@ export const useTopologyStore = defineStore('topology', () => {
     createNode(id, profile, kind)
   }
 
-  /** Replace an edge node's uplink kind. Only valid when unlinked. */
+  /** Replace a node's uplink kind. Only valid when unlinked. */
   function setLinkKind(id: string, kind: LinkKindType) {
     const handle = nodeHandles.get(id)
     if (!handle) return
     if (handle.linkCount > 0) throw new Error('disconnect the node before changing its link kind')
-    if (handle.profile !== NodeProfile.Edge) return
+    if (handle.profile === NodeProfile.Router) return
     destroyNode(id)
-    createNode(id, 'edge', kind)
+    createNode(id, handle.profile === NodeProfile.Bridge ? 'bridge' : 'edge', kind)
   }
 
   /** Ping from one canvas node to another, using the target's address. */
@@ -193,6 +203,16 @@ export const useTopologyStore = defineStore('topology', () => {
       }
       networkId = status.netId
       nodeId = status.nodeId ?? 2
+    } else if (status.profile === 'bridge') {
+      if (status.upstream === 'active' && status.upstreamNetId) {
+        networkId = status.upstreamNetId
+        nodeId = 2
+      } else if (status.nets[0] !== undefined) {
+        networkId = status.nets[0]
+        nodeId = 1
+      } else {
+        throw new Error('target bridge has no active links')
+      }
     } else {
       const net = status.nets[0]
       if (net === undefined) throw new Error('target router has no active links')
@@ -205,6 +225,7 @@ export const useTopologyStore = defineStore('topology', () => {
   return {
     ready,
     statuses,
+    linkCounts,
     frames,
     linkActivity,
     sensorData,
