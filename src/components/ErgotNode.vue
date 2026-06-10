@@ -130,24 +130,34 @@ const isValidConnection = (conn: Connection) => store.canConnect(conn.source, co
 
     <div class="text-[9px] text-(--ui-text-muted) mb-0.5 truncate">{{ addressLabel }}</div>
 
-    <USelect
-      :model-value="data.profile"
-      :items="profileOptions"
-      :disabled="linked"
-      size="xs"
-      class="w-full"
-      @update:model-value="onProfileChange"
-    />
+    <div :title="linked ? 'Disconnect the node to change its profile' : 'Node profile'">
+      <USelect
+        :model-value="data.profile"
+        :items="profileOptions"
+        :disabled="linked"
+        size="xs"
+        class="w-full"
+        @update:model-value="onProfileChange"
+      />
+    </div>
 
-    <USelect
+    <div
       v-if="data.profile === 'edge'"
-      :model-value="data.kind"
-      :items="kindOptions"
-      :disabled="linked"
-      size="xs"
-      class="w-full mt-0.5"
-      @update:model-value="onKindChange"
-    />
+      :title="
+        linked
+          ? 'Disconnect the node to change its uplink transport'
+          : 'Uplink transport: COBS byte stream or one-message-one-frame packets'
+      "
+    >
+      <USelect
+        :model-value="data.kind"
+        :items="kindOptions"
+        :disabled="linked"
+        size="xs"
+        class="w-full mt-0.5"
+        @update:model-value="onKindChange"
+      />
+    </div>
 
     <!-- Downlink handle (routers fan out to edges) -->
     <Handle

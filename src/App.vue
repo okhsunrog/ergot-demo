@@ -4,6 +4,7 @@ import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Connection } from '@vue-flow/core'
 import ErgotNode from './components/ErgotNode.vue'
 import FrameInspector from './components/FrameInspector.vue'
+import HelpModal from './components/HelpModal.vue'
 import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
 
 const store = useTopologyStore()
@@ -99,6 +100,15 @@ function onKeyDown(e: KeyboardEvent) {
   }
 }
 
+// Help modal: shown automatically on the first visit
+const HELP_SEEN_KEY = 'ergot-demo-help-seen'
+const showHelp = ref(false)
+
+function openHelp() {
+  showHelp.value = true
+  localStorage.setItem(HELP_SEEN_KEY, '1')
+}
+
 // Frame inspector and per-link activity animation
 const showInspector = ref(true)
 
@@ -167,6 +177,7 @@ let refreshTimer: ReturnType<typeof setInterval> | undefined
 let frameTimer: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
+  if (!localStorage.getItem(HELP_SEEN_KEY)) openHelp()
   await store.initWasm()
 
   // Seed a small default topology: one router with two edge nodes.
@@ -217,21 +228,25 @@ onUnmounted(() => {
             class="flex items-center gap-1 text-xs text-(--ui-text-muted) border-l border-(--ui-border-muted) pl-2"
           >
             <span>lat</span>
-            <UInput
-              v-model.number="latencyMs"
-              type="number"
-              size="xs"
-              class="w-16"
-              @change="applyImpairment"
-            />
+            <UTooltip text="Artificial one-way latency added to each direction of the link">
+              <UInput
+                v-model.number="latencyMs"
+                type="number"
+                size="xs"
+                class="w-16"
+                @change="applyImpairment"
+              />
+            </UTooltip>
             <span>ms · loss</span>
-            <UInput
-              v-model.number="lossPct"
-              type="number"
-              size="xs"
-              class="w-14"
-              @change="applyImpairment"
-            />
+            <UTooltip text="Probability of dropping each chunk/frame, per direction">
+              <UInput
+                v-model.number="lossPct"
+                type="number"
+                size="xs"
+                class="w-14"
+                @change="applyImpairment"
+              />
+            </UTooltip>
             <span>%</span>
           </div>
           <UButton
@@ -240,6 +255,12 @@ onUnmounted(() => {
             @click="showInspector = !showInspector"
             >Frames</UButton
           >
+          <UButton
+            variant="ghost"
+            icon="i-lucide-circle-help"
+            aria-label="Help"
+            @click="openHelp"
+          />
           <UColorModeButton />
         </div>
       </header>
@@ -251,6 +272,7 @@ onUnmounted(() => {
         </VueFlow>
       </div>
       <FrameInspector v-if="showInspector" :frames="store.frames" :resolve-link="resolveLink" />
+      <HelpModal v-model:open="showHelp" />
     </div>
   </UApp>
 </template>
