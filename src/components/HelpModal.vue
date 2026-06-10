@@ -19,7 +19,7 @@ const open = defineModel<boolean>('open', { required: true })
         </p>
         <ul class="space-y-2 list-disc pl-5">
           <li>
-            <b>Ping:</b> select two nodes (click, then ctrl/shift-click), hit <b>Ping</b> — the
+            <b>Ping:</b> select two nodes (click, then ctrl-click — ⌘ on Mac), hit <b>Ping</b> — the
             request hops edge → router → edge and shows the round trip.
           </li>
           <li>

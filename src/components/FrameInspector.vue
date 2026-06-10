@@ -47,7 +47,7 @@ function fmtTime(ts: number): string {
         >
           <td class="px-3 py-0.5 text-(--ui-text-muted)">{{ fmtTime(f.ts) }}</td>
           <td class="px-3 py-0.5">{{ resolveLink(f.linkId) }}</td>
-          <td class="px-3 py-0.5">{{ f.dir === 'down' ? '↓' : '↑' }}</td>
+          <td class="px-3 py-0.5">{{ f.dir === 'down' ? '→' : '←' }}</td>
           <td class="px-3 py-0.5">{{ f.src }} → {{ f.dst }}</td>
           <td class="px-3 py-0.5">
             <span :style="{ color: kindColors[f.kind] }">{{ f.kind }}</span>
