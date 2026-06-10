@@ -73,7 +73,8 @@ up your local changes).
 
 ```sh
 vp install
-vp run dev      # wasm build + dev server with wasm hot-rebuild
+vp run wasm:build   # build the Rust → WASM module (needed once; cached after)
+vp dev              # dev server with wasm hot-rebuild
 ```
 
 Editing `.rs` files under `wasm/` (or the ergot worktree) triggers a wasm
@@ -85,5 +86,5 @@ rebuild; the page reloads automatically.
 vp test             # runtime tests of the WASM node API (plain Node, no browser)
 vp check            # format, lint, type checks
 vp run typecheck    # vue-tsc only
-vp run build        # production build
+vp build            # production build
 ```
