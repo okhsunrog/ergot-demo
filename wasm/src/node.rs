@@ -20,43 +20,48 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
-use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel};
-use futures_core::Stream;
+use futures_channel::mpsc::channel;
 use gloo_timers::future::TimeoutFuture;
 use maitake_sync::WaitQueue;
-use serde::{Serialize as SerdeSerialize, Serialize};
+use serde::Serialize;
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use ergot::{
-    Address, HeaderSeq, ProtocolError,
+    Address,
     interface_manager::{
-        Interface, InterfaceSink, InterfaceState, Profile,
+        InterfaceState, Profile,
         profiles::{
-            direct_edge::{DirectEdge, EDGE_NODE_ID, EdgeFrameProcessor},
-            router::{Router, RouterFrameProcessor, UPSTREAM_IDENT},
+            direct_edge::{DirectEdge, EDGE_NODE_ID},
+            router::{Router, UPSTREAM_IDENT},
         },
-        transports::{
-            futures_io::{RxWorker, tx_worker},
-            packet::{PacketReceiver, PacketRxTxWorker, PacketSender},
-        },
-        utils::{
-            cobs_stream, framed_stream,
-            std::{StdQueue, new_std_queue},
-        },
+        utils::std::{StdQueue, new_std_queue},
     },
-    net_stack::{ArcNetStack, services::bridge_seed_assign},
+    net_stack::ArcNetStack,
     well_known::ErgotPingEndpoint,
 };
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
 
 use crate::duplex;
+
+mod frame_tap;
+mod impairment;
+mod seed;
+mod transport;
+
+pub use frame_tap::{FrameEvent, FrameEventBatch, take_frame_events};
+use frame_tap::{Tap, TapBinding, TapLabel, WasmInterface, new_sink, next_link_generation};
+use impairment::{Impairment, spawn_packet_impairment, spawn_stream_impairment};
+use seed::spawn_seed_assign;
+use transport::{
+    StackSide, router_tx_half, spawn_packet_worker, spawn_stream_rx, spawn_stream_tx,
+};
 
 // The demo's sensor stream: a plain f32 reading, fire-and-forget.
 ergot::topic!(SensorTopic, f32, "ergot-demo/sensor");
@@ -69,58 +74,6 @@ const MAX_INTERFACES: usize = 16;
 const MAX_SEEDS: usize = 16;
 const PACKET_QUEUE_FRAMES: usize = 16;
 const MAX_LATENCY_MS: u32 = 60_000;
-
-// ---------------------------------------------------------------------------
-// Frame tap: every frame leaving any interface is recorded for the UI
-// ---------------------------------------------------------------------------
-
-/// One observed frame, as seen at the sending interface.
-#[derive(Serialize, Tsify, Clone)]
-#[tsify(into_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct FrameEvent {
-    /// The canvas edge id this frame travelled on.
-    pub link_id: String,
-    /// "down" = router→edge, "up" = edge→router.
-    pub dir: String,
-    pub src: String,
-    pub dst: String,
-    /// "req" | "resp" | "topic" | "err" | numeric kind.
-    pub kind: String,
-    pub seq: u16,
-    /// `Date.now()` timestamp.
-    pub ts: f64,
-}
-
-#[derive(Serialize, Tsify)]
-#[tsify(into_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct FrameEventBatch {
-    pub events: Vec<FrameEvent>,
-}
-
-const MAX_EVENTS: usize = 256;
-
-thread_local! {
-    static FRAME_EVENTS: RefCell<VecDeque<FrameEvent>> = const { RefCell::new(VecDeque::new()) };
-    static NEXT_LINK_GENERATION: Cell<u64> = const { Cell::new(1) };
-}
-
-fn next_link_generation() -> u64 {
-    NEXT_LINK_GENERATION.with(|next| {
-        let generation = next.get();
-        next.set(generation.wrapping_add(1).max(1));
-        generation
-    })
-}
-
-/// Drain all frame events recorded since the last call. Poll this from the UI.
-#[wasm_bindgen(js_name = takeFrameEvents)]
-pub fn take_frame_events() -> FrameEventBatch {
-    FRAME_EVENTS.with(|q| FrameEventBatch {
-        events: q.borrow_mut().drain(..).collect(),
-    })
-}
 
 fn fmt_addr(a: &Address) -> String {
     format!("{}.{}:{}", a.network_id, a.node_id, a.port_id)
@@ -139,121 +92,6 @@ fn push_sample(
         value: msg.t,
         src: fmt_addr(&msg.hdr.src),
     });
-}
-
-fn kind_name(kind: u8) -> String {
-    match kind {
-        1 => "req".into(),
-        2 => "resp".into(),
-        3 => "topic".into(),
-        255 => "err".into(),
-        other => other.to_string(),
-    }
-}
-
-#[derive(Clone)]
-struct TapBinding {
-    generation: u64,
-    label: String,
-}
-
-type TapLabel = Rc<RefCell<Option<TapBinding>>>;
-
-/// A tap attached to one interface sink. `label` identifies the canvas edge
-/// currently served by the interface (None while disconnected).
-#[derive(Clone)]
-struct Tap {
-    label: TapLabel,
-    dir: &'static str,
-}
-
-impl Tap {
-    fn record(&self, hdr: &HeaderSeq) {
-        let Some(binding) = self.label.borrow().clone() else {
-            return;
-        };
-        let ev = FrameEvent {
-            link_id: binding.label,
-            dir: self.dir.into(),
-            src: fmt_addr(&hdr.src),
-            dst: fmt_addr(&hdr.dst),
-            kind: kind_name(hdr.kind.0),
-            seq: hdr.seq_no,
-            ts: js_sys::Date::now(),
-        };
-        FRAME_EVENTS.with(|q| {
-            let mut q = q.borrow_mut();
-            if q.len() >= MAX_EVENTS {
-                q.pop_front();
-            }
-            q.push_back(ev);
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sink: one type dispatching both interface flavors
-// ---------------------------------------------------------------------------
-
-/// A profile's `Interface::Sink` is a single type, so supporting both link
-/// kinds on one router requires dispatching at the sink level. The sink is
-/// also where the frame tap lives: every outgoing frame passes through here
-/// with its header in decoded form.
-enum SinkInner {
-    Stream(cobs_stream::Sink<StdQueue>),
-    Packet(framed_stream::Sink<StdQueue>),
-}
-
-struct WasmSink {
-    inner: SinkInner,
-    tap: Tap,
-}
-
-impl InterfaceSink for WasmSink {
-    fn mtu(&self) -> u16 {
-        match &self.inner {
-            SinkInner::Stream(s) => s.mtu(),
-            SinkInner::Packet(s) => s.mtu(),
-        }
-    }
-
-    fn send_ty<T: SerdeSerialize>(&mut self, hdr: &HeaderSeq, body: &T) -> Result<(), ()> {
-        let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_ty(hdr, body),
-            SinkInner::Packet(s) => s.send_ty(hdr, body),
-        };
-        if result.is_ok() {
-            self.tap.record(hdr);
-        }
-        result
-    }
-
-    fn send_raw(&mut self, hdr: &HeaderSeq, body: &[u8]) -> Result<(), ()> {
-        let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_raw(hdr, body),
-            SinkInner::Packet(s) => s.send_raw(hdr, body),
-        };
-        if result.is_ok() {
-            self.tap.record(hdr);
-        }
-        result
-    }
-
-    fn send_err(&mut self, hdr: &HeaderSeq, err: ProtocolError) -> Result<(), ()> {
-        let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_err(hdr, err),
-            SinkInner::Packet(s) => s.send_err(hdr, err),
-        };
-        if result.is_ok() {
-            self.tap.record(hdr);
-        }
-        result
-    }
-}
-
-struct WasmInterface;
-impl Interface for WasmInterface {
-    type Sink = WasmSink;
 }
 
 type EdgeStack = ArcNetStack<CriticalSectionRawMutex, DirectEdge<WasmInterface>>;
@@ -301,59 +139,6 @@ impl LinkState {
             if owns_binding {
                 *label.borrow_mut() = None;
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Packet links: in-memory frame channels
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-struct LinkClosed;
-
-/// One end of an in-memory packet link: each channel message is one
-/// complete ergot frame. `recv` also watches the link closer, which is how
-/// packet workers get torn down (`PacketRxTxWorker` has no closer input).
-struct ChannelRx {
-    rx: MpscReceiver<Vec<u8>>,
-    closer: Arc<WaitQueue>,
-}
-
-impl PacketReceiver for ChannelRx {
-    type Error = LinkClosed;
-
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, LinkClosed> {
-        let next = core::future::poll_fn(|cx| Pin::new(&mut self.rx).poll_next(cx));
-        match select(next, self.closer.wait()).await {
-            Either::First(Some(frame)) if frame.len() <= buf.len() => {
-                buf[..frame.len()].copy_from_slice(&frame);
-                Ok(frame.len())
-            }
-            _ => Err(LinkClosed),
-        }
-    }
-}
-
-struct ChannelTx {
-    tx: MpscSender<Vec<u8>>,
-    overflow_drops: Rc<Cell<u32>>,
-}
-
-impl PacketSender for ChannelTx {
-    type Error = LinkClosed;
-
-    async fn send(&mut self, data: &[u8]) -> Result<(), LinkClosed> {
-        match self.tx.try_send(data.to_vec()) {
-            Ok(()) => Ok(()),
-            // A full simulated link buffer drops the frame instead of
-            // growing browser memory or tearing the interface down.
-            Err(e) if e.is_full() => {
-                self.overflow_drops
-                    .set(self.overflow_drops.get().saturating_add(1));
-                Ok(())
-            }
-            Err(_) => Err(LinkClosed),
         }
     }
 }
@@ -1108,336 +893,6 @@ impl Drop for WasmLink {
     fn drop(&mut self) {
         self.disconnect();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Transport worker plumbing
-// ---------------------------------------------------------------------------
-
-fn new_sink(kind: LinkKind, queue: &StdQueue, tap: Tap) -> WasmSink {
-    let inner = match kind {
-        LinkKind::Stream => SinkInner::Stream(cobs_stream::Sink::new_from_handle(queue.clone(), MTU)),
-        LinkKind::Packet => SinkInner::Packet(framed_stream::Sink::new_from_handle(queue.clone(), MTU)),
-    };
-    WasmSink { inner, tap }
-}
-
-fn router_tx_half(tx: MpscSender<Vec<u8>>, impairment: &Impairment) -> ChannelTx {
-    ChannelTx {
-        tx,
-        overflow_drops: impairment.overflow_drops.clone(),
-    }
-}
-
-/// One side of a link, for transport worker spawning.
-enum StackSide {
-    /// Parent downlink on a router-profile stack (router or bridge).
-    RouterDown(RouterStack, u8, u16),
-    /// Bridge uplink (UPSTREAM_IDENT, edge-style frame processing).
-    BridgeUp(RouterStack),
-    /// Edge uplink.
-    Edge(EdgeStack),
-}
-
-fn spawn_stream_rx(side: StackSide, reader: duplex::PipeReader, closer: Arc<WaitQueue>) {
-    spawn_local(async move {
-        let mut frame = vec![0u8; BUF_SIZE];
-        let mut scratch = vec![0u8; BUF_SIZE];
-        match side {
-            StackSide::RouterDown(stack, ident, net_id) => {
-                let mut rx_worker = RxWorker::new(
-                    stack.clone(),
-                    reader,
-                    RouterFrameProcessor::new(net_id),
-                    ident,
-                )
-                .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
-                closer.close();
-                drop(rx_worker);
-                stack.manage_profile(|im| {
-                    let _ = im.deregister_interface(ident);
-                });
-            }
-            StackSide::BridgeUp(stack) => {
-                let mut rx_worker =
-                    RxWorker::new(stack, reader, EdgeFrameProcessor::new(), UPSTREAM_IDENT)
-                        .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
-                closer.close();
-            }
-            StackSide::Edge(stack) => {
-                let mut rx_worker = RxWorker::new(stack, reader, EdgeFrameProcessor::new(), ())
-                    .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
-                closer.close();
-            }
-        }
-    });
-}
-
-fn spawn_stream_tx(writer: duplex::PipeWriter, queue: StdQueue, closer: Arc<WaitQueue>) {
-    spawn_local(async move {
-        let consumer = queue.stream_consumer();
-        let mut writer = writer;
-        let _ = select(tx_worker(&mut writer, consumer), closer.wait()).await;
-        closer.close();
-    });
-}
-
-fn spawn_packet_worker(
-    side: StackSide,
-    rx: MpscReceiver<Vec<u8>>,
-    tx: ChannelTx,
-    queue: StdQueue,
-    initial_state: InterfaceState,
-    closer: Arc<WaitQueue>,
-) {
-    let receiver = ChannelRx {
-        rx,
-        closer: closer.clone(),
-    };
-    spawn_local(async move {
-        let consumer = queue.framed_consumer();
-        let mut scratch = vec![0u8; BUF_SIZE];
-        match side {
-            StackSide::RouterDown(stack, ident, net_id) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack.clone(),
-                    receiver,
-                    tx,
-                    RouterFrameProcessor::new(net_id),
-                    ident,
-                    consumer,
-                );
-                let _ = worker.run(initial_state, &mut scratch).await;
-                closer.close();
-                drop(worker);
-                stack.manage_profile(|im| {
-                    let _ = im.deregister_interface(ident);
-                });
-            }
-            StackSide::BridgeUp(stack) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack,
-                    receiver,
-                    tx,
-                    EdgeFrameProcessor::new(),
-                    UPSTREAM_IDENT,
-                    consumer,
-                );
-                let _ = worker.run(initial_state, &mut scratch).await;
-                closer.close();
-            }
-            StackSide::Edge(stack) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack,
-                    receiver,
-                    tx,
-                    EdgeFrameProcessor::new(),
-                    (),
-                    consumer,
-                );
-                let _ = worker.run(initial_state, &mut scratch).await;
-                closer.close();
-            }
-        }
-    });
-}
-
-/// Manage the seed lease of one pending bridge downlink: wait for the
-/// bridge's uplink to become active, lease a network id from the upstream
-/// seed router, warm the new net with one ping so the child learns its
-/// address — then keep the lease alive by refreshing it before expiry
-/// (leases start at 30 s; without refresh the upstream drops the route).
-/// Falls back to a fresh assignment if refreshing fails repeatedly.
-fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQueue>) {
-    /// Wait `ms`; true means the link closed and the task should end.
-    async fn closed_within(closer: &WaitQueue, ms: u32) -> bool {
-        matches!(
-            select(TimeoutFuture::new(ms), closer.wait()).await,
-            Either::Second(_)
-        )
-    }
-
-    spawn_local(async move {
-        'assign: loop {
-            // Phase 1: wait for the uplink, then lease a net id.
-            let mut retry_ms = 150;
-            let lease = loop {
-                if closed_within(&closer, retry_ms).await {
-                    return;
-                }
-                let upstream_active = stack.manage_profile(|im| {
-                    matches!(
-                        im.interface_state(UPSTREAM_IDENT),
-                        Some(InterfaceState::Active { .. })
-                    )
-                });
-                if !upstream_active {
-                    retry_ms = 150;
-                    continue;
-                }
-                match bridge_seed_assign(&stack, UPSTREAM_IDENT, ident).await {
-                    Ok(lease) => break lease,
-                    Err(e) => {
-                        retry_ms = (retry_ms * 2).min(5_000);
-                        log::warn!("seed assignment failed (retry in {retry_ms} ms): {e:?}");
-                    }
-                }
-            };
-
-            // Warm the leased net so the child learns its address.
-            let addr = Address {
-                network_id: lease.net_id,
-                node_id: EDGE_NODE_ID,
-                port_id: 0,
-            };
-            let warm = async {
-                let _ = stack
-                    .endpoints()
-                    .request::<ErgotPingEndpoint>(addr, &0u32, Some("ping"))
-                    .await;
-            };
-            let _ = select(warm, TimeoutFuture::new(300)).await;
-
-            // Phase 2: keep the lease alive.
-            let mut lease = lease;
-            let mut failures = 0u32;
-            loop {
-                let delay_s = if failures == 0 {
-                    u32::from(
-                        lease
-                            .expires_seconds
-                            .saturating_sub(lease.min_refresh_seconds),
-                    )
-                    .max(1)
-                } else {
-                    2 // retry quickly while the lease is still at risk
-                };
-                if closed_within(&closer, delay_s * 1000).await {
-                    return;
-                }
-                match ergot::net_stack::services::bridge_seed_refresh(&stack, &lease).await {
-                    Ok(refreshed) => {
-                        lease = refreshed;
-                        failures = 0;
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        log::warn!("seed refresh failed ({failures}x): {e:?}");
-                        if failures >= 3 {
-                            // The lease is likely gone upstream; start over.
-                            continue 'assign;
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Link impairment: artificial latency and loss per direction
-// ---------------------------------------------------------------------------
-
-/// Shared, live-tunable impairment parameters for one link.
-#[derive(Clone, Default)]
-struct Impairment {
-    latency_ms: Rc<Cell<u32>>,
-    loss_pct: Rc<Cell<u8>>,
-    overflow_drops: Rc<Cell<u32>>,
-}
-
-impl Impairment {
-    /// Apply the configured delay, then decide whether to drop this unit.
-    async fn delay_and_drop(&self, closer: &WaitQueue) -> Option<bool> {
-        let latency = self.latency_ms.get();
-        if latency > 0
-            && matches!(
-                select(TimeoutFuture::new(latency), closer.wait()).await,
-                Either::Second(_)
-            )
-        {
-            return None;
-        }
-        let loss = self.loss_pct.get();
-        Some(loss > 0 && js_sys::Math::random() * 100.0 < f64::from(loss))
-    }
-}
-
-async fn pipe_read(reader: &mut duplex::PipeReader, buf: &mut [u8]) -> std::io::Result<usize> {
-    use futures_io::AsyncRead;
-    core::future::poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, buf)).await
-}
-
-async fn pipe_write_all(writer: &mut duplex::PipeWriter, mut buf: &[u8]) -> std::io::Result<()> {
-    use futures_io::AsyncWrite;
-    while !buf.is_empty() {
-        let n = core::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, buf)).await?;
-        buf = &buf[n..];
-    }
-    Ok(())
-}
-
-/// Forward bytes between two pipes, applying latency/loss per chunk. On a
-/// stream link a dropped chunk corrupts the COBS stream mid-frame; the
-/// receiver's accumulator resyncs at the next frame delimiter — i.e. real
-/// frame loss, the honest serial-cable failure mode.
-fn spawn_stream_impairment(
-    mut rx: duplex::PipeReader,
-    mut tx: duplex::PipeWriter,
-    impairment: Impairment,
-    closer: Arc<WaitQueue>,
-) {
-    spawn_local(async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            let read = pipe_read(&mut rx, &mut buf);
-            let n = match select(read, closer.wait()).await {
-                Either::First(Ok(n)) if n > 0 => n,
-                _ => return,
-            };
-            match impairment.delay_and_drop(&closer).await {
-                Some(true) => continue,
-                Some(false) => {}
-                None => return,
-            }
-            if pipe_write_all(&mut tx, &buf[..n]).await.is_err() {
-                return;
-            }
-        }
-    });
-}
-
-/// Forward frames between two channels, applying latency/loss per frame.
-fn spawn_packet_impairment(
-    mut rx: MpscReceiver<Vec<u8>>,
-    mut tx: MpscSender<Vec<u8>>,
-    impairment: Impairment,
-    closer: Arc<WaitQueue>,
-) {
-    spawn_local(async move {
-        loop {
-            let next = core::future::poll_fn(|cx| Pin::new(&mut rx).poll_next(cx));
-            let frame = match select(next, closer.wait()).await {
-                Either::First(Some(frame)) => frame,
-                _ => return,
-            };
-            match impairment.delay_and_drop(&closer).await {
-                Some(true) => continue,
-                Some(false) => {}
-                None => return,
-            }
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(e) if e.is_full() => impairment
-                    .overflow_drops
-                    .set(impairment.overflow_drops.get().saturating_add(1)),
-                Err(_) => return,
-            }
-        }
-    });
 }
 
 /// Yield to the microtask queue once, letting freshly spawned tasks run.
