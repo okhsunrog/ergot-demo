@@ -1,1 +1,2 @@
 vp staged
+cargo fmt --manifest-path wasm/Cargo.toml -- --check

@@ -50,13 +50,27 @@ export default defineConfig({
     printWidth: 100,
   },
   lint: {
-    plugins: ['typescript', 'unicorn', 'vue'],
+    plugins: ['eslint', 'typescript', 'unicorn', 'oxc', 'vue'],
     categories: {
       correctness: 'error',
     },
     env: {
       browser: true,
       builtin: true,
+    },
+    rules: {
+      'no-array-constructor': 'error',
+      'typescript/ban-ts-comment': 'error',
+      'typescript/no-empty-object-type': 'error',
+      'typescript/no-explicit-any': 'error',
+      'typescript/no-namespace': 'error',
+      'typescript/no-require-imports': 'error',
+      'typescript/no-unnecessary-type-constraint': 'error',
+      'typescript/no-unsafe-function-type': 'error',
+      'no-var': 'error',
+      'prefer-const': 'error',
+      'prefer-rest-params': 'error',
+      'prefer-spread': 'error',
     },
     options: {
       typeAware: true,

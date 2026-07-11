@@ -9,10 +9,11 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          components: clippy, rustfmt
           targets: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
@@ -27,6 +28,8 @@ jobs:
           cache: true
       - run: vp install --frozen-lockfile
 
+      - run: cargo fmt --manifest-path wasm/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: vp run wasm:build
       - run: vp check
       - run: vp run typecheck
