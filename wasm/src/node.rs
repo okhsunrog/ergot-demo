@@ -218,27 +218,36 @@ impl InterfaceSink for WasmSink {
     }
 
     fn send_ty<T: SerdeSerialize>(&mut self, hdr: &HeaderSeq, body: &T) -> Result<(), ()> {
-        self.tap.record(hdr);
-        match &mut self.inner {
+        let result = match &mut self.inner {
             SinkInner::Stream(s) => s.send_ty(hdr, body),
             SinkInner::Packet(s) => s.send_ty(hdr, body),
+        };
+        if result.is_ok() {
+            self.tap.record(hdr);
         }
+        result
     }
 
     fn send_raw(&mut self, hdr: &HeaderSeq, body: &[u8]) -> Result<(), ()> {
-        self.tap.record(hdr);
-        match &mut self.inner {
+        let result = match &mut self.inner {
             SinkInner::Stream(s) => s.send_raw(hdr, body),
             SinkInner::Packet(s) => s.send_raw(hdr, body),
+        };
+        if result.is_ok() {
+            self.tap.record(hdr);
         }
+        result
     }
 
     fn send_err(&mut self, hdr: &HeaderSeq, err: ProtocolError) -> Result<(), ()> {
-        self.tap.record(hdr);
-        match &mut self.inner {
+        let result = match &mut self.inner {
             SinkInner::Stream(s) => s.send_err(hdr, err),
             SinkInner::Packet(s) => s.send_err(hdr, err),
+        };
+        if result.is_ok() {
+            self.tap.record(hdr);
         }
+        result
     }
 }
 
@@ -1254,8 +1263,9 @@ fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQueue>) {
     spawn_local(async move {
         'assign: loop {
             // Phase 1: wait for the uplink, then lease a net id.
+            let mut retry_ms = 150;
             let lease = loop {
-                if closed_within(&closer, 150).await {
+                if closed_within(&closer, retry_ms).await {
                     return;
                 }
                 let upstream_active = stack.manage_profile(|im| {
@@ -1265,11 +1275,15 @@ fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQueue>) {
                     )
                 });
                 if !upstream_active {
+                    retry_ms = 150;
                     continue;
                 }
                 match bridge_seed_assign(&stack, UPSTREAM_IDENT, ident).await {
                     Ok(lease) => break lease,
-                    Err(e) => log::warn!("seed assignment failed (will retry): {e:?}"),
+                    Err(e) => {
+                        retry_ms = (retry_ms * 2).min(5_000);
+                        log::warn!("seed assignment failed (retry in {retry_ms} ms): {e:?}");
+                    }
                 }
             };
 

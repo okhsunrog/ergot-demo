@@ -233,6 +233,37 @@ test('frame tap records labelled request and response frames', async () => {
   router.free()
 })
 
+test('frame tap excludes frames rejected by a full interface queue', () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const link = router.connectTo(edge, 'backpressure-link')
+  takeFrameEvents()
+
+  let queued = 0
+  let recorded = 0
+  for (let i = 0; i < 1_000; i++) {
+    try {
+      router.publishSensor(i)
+      queued++
+    } catch {
+      recorded += takeFrameEvents().events.filter(
+        (event) => event.linkId === 'backpressure-link',
+      ).length
+      break
+    }
+    recorded += takeFrameEvents().events.filter(
+      (event) => event.linkId === 'backpressure-link',
+    ).length
+  }
+
+  expect(queued).toBeLessThan(1_000)
+  expect(recorded).toBe(queued)
+
+  link.free()
+  edge.free()
+  router.free()
+})
+
 test('impairment: latency raises RTT, full loss kills the link', async () => {
   const router = new WasmNode(NodeProfile.Router)
   const edge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
