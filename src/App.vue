@@ -45,6 +45,18 @@ function addNode(
   return id
 }
 
+function addRouter() {
+  addNode('router')
+}
+
+function addBridge() {
+  addNode('bridge')
+}
+
+function addEdge() {
+  addNode('edge')
+}
+
 function connectNodes(source: string, target: string): boolean {
   if (!store.canConnect(source, target)) return false
   const edgeId = newEdgeId()
@@ -139,6 +151,10 @@ function openHelp() {
 
 // Frame inspector and per-link activity animation
 const showInspector = ref(true)
+
+function toggleInspector() {
+  showInspector.value = !showInspector.value
+}
 
 function resolveLink(edgeId: string): string {
   const edge = edges.value.find((e) => e.id === edgeId)
@@ -248,15 +264,13 @@ onUnmounted(() => {
       >
         <h1 class="text-lg font-semibold text-(--ui-text-highlighted)">Ergot Network Topology</h1>
         <div class="flex gap-2 items-center">
-          <UButton icon="i-lucide-router" :disabled="!store.ready" @click="addNode('router')"
+          <UButton icon="i-lucide-router" :disabled="!store.ready" @click="addRouter"
             >Add Router</UButton
           >
-          <UButton icon="i-lucide-git-fork" :disabled="!store.ready" @click="addNode('bridge')"
+          <UButton icon="i-lucide-git-fork" :disabled="!store.ready" @click="addBridge"
             >Add Bridge</UButton
           >
-          <UButton icon="i-lucide-plus" :disabled="!store.ready" @click="addNode('edge')"
-            >Add Node</UButton
-          >
+          <UButton icon="i-lucide-plus" :disabled="!store.ready" @click="addEdge">Add Node</UButton>
           <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected"
             >Delete</UButton
           >
@@ -294,7 +308,7 @@ onUnmounted(() => {
           <UButton
             :variant="showInspector ? 'solid' : 'outline'"
             icon="i-lucide-list"
-            @click="showInspector = !showInspector"
+            @click="toggleInspector"
             >Frames</UButton
           >
           <UButton

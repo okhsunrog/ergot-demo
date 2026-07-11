@@ -10,7 +10,7 @@ Router / DirectEdge profiles. A frame inspector shows every frame on the wire,
 links animate with traffic, and per-link latency/loss knobs let you watch the
 UDP-like semantics degrade honestly.
 
-Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
+Built with Vue 3.5, Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 (`wasm/`), managed with [Vite+](https://viteplus.dev/).
 
 ## What works today
@@ -60,7 +60,7 @@ Built with Vue 3.6 (Vapor), Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 
 ## Prerequisites
 
-- [Vite+](https://viteplus.dev/) (`vp`) and bun
+- [Vite+](https://viteplus.dev/) (`vp`); it provisions the pinned Node and Bun versions
 - Rust with the `wasm32-unknown-unknown` target and `wasm-pack`
   (`cargo install wasm-pack`)
 

@@ -1,9 +1,7 @@
 import { fileURLToPath, URL } from 'node:url'
 import { execSync } from 'node:child_process'
 
-import { defineConfig, type Plugin } from 'vite-plus'
-import vue from '@vitejs/plugin-vue'
-import ui from '@nuxt/ui/vite'
+import { defineConfig, lazyPlugins, type Plugin } from 'vite-plus'
 
 function wasmHotRebuild(): Plugin {
   let building = false
@@ -49,16 +47,44 @@ export default defineConfig({
   fmt: {
     semi: false,
     singleQuote: true,
+    printWidth: 100,
   },
   lint: {
+    plugins: ['typescript', 'unicorn', 'vue'],
+    categories: {
+      correctness: 'error',
+    },
+    env: {
+      browser: true,
+      builtin: true,
+    },
     options: {
       typeAware: true,
+      typeCheck: true,
+    },
+  },
+  test: {
+    include: ['src/**/*.test.ts'],
+  },
+  build: {
+    // Nuxt UI is intentionally shipped as one application bundle; keep the
+    // warning useful for future growth without flagging the current baseline.
+    chunkSizeWarningLimit: 700,
+    rolldownOptions: {
+      onLog(level, log, handler) {
+        if (log.code === 'INVALID_ANNOTATION' && log.id?.includes('@vueuse/core/dist/index.js')) {
+          return
+        }
+        handler(level, log)
+      },
     },
   },
   run: {
     tasks: {
       typecheck: {
         command: 'vp exec vue-tsc --build',
+        dependsOn: ['wasm:build'],
+        output: [],
       },
       'wasm:build': {
         command: 'wasm-pack build wasm --target web --out-dir ../src/wasm-pkg',
@@ -71,7 +97,13 @@ export default defineConfig({
       },
     },
   },
-  plugins: [vue(), ui(), wasmHotRebuild()],
+  plugins: lazyPlugins(async () => {
+    const [{ default: vue }, { default: ui }] = await Promise.all([
+      import('@vitejs/plugin-vue'),
+      import('@nuxt/ui/vite'),
+    ])
+    return [vue(), ui(), wasmHotRebuild()]
+  }),
   server: {
     watch: {
       ignored: ['**/wasm/target/**'],
