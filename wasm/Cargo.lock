@@ -79,7 +79,7 @@ dependencies = [
 [[package]]
 name = "cobs-acc"
 version = "0.1.0"
-source = "git+https://github.com/jamesmunns/ergot?branch=main#f61a4109683f8798e93b6ed812bc7e44220857f5"
+source = "git+https://github.com/okhsunrog/ergot?branch=seed-delegation#c43f039aa392552188783ccd3a6b13d930c9430e"
 dependencies = [
  "cobs 0.4.0",
 ]
@@ -229,7 +229,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 [[package]]
 name = "ergot"
 version = "0.12.0"
-source = "git+https://github.com/jamesmunns/ergot?branch=main#f61a4109683f8798e93b6ed812bc7e44220857f5"
+source = "git+https://github.com/okhsunrog/ergot?branch=seed-delegation#c43f039aa392552188783ccd3a6b13d930c9430e"
 dependencies = [
  "bbqueue",
  "cobs 0.3.0",

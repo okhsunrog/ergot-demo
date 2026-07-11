@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 embassy-futures = "0.1.2"
-ergot = { git = "https://github.com/jamesmunns/ergot", branch = "main", default-features = false, features = [
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "seed-delegation", default-features = false, features = [
   "std",
   "futures-io",
 ] }
