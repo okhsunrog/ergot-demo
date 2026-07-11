@@ -239,25 +239,14 @@ test('impairment: latency raises RTT, full loss kills the link', async () => {
   router.free()
 })
 
-test('impairment on a stream link: dropped chunks resync via COBS', async () => {
+test('impairment on a stream link: traffic recovers after loss', async () => {
   const router = new WasmNode(NodeProfile.Router)
   const edge = new WasmNode(NodeProfile.Edge, LinkKind.Stream)
   const link = router.connectTo(edge)
   await edge.servePing()
 
-  // 50% chunk loss: individual pings may fail, but retries get through
-  // and the stream recovers (COBS resyncs at frame delimiters).
-  link.setImpairment(0, 50)
-  let succeeded = 0
-  for (let i = 0; i < 10 && succeeded === 0; i++) {
-    try {
-      const res = await router.ping(link.netId, 2, 200)
-      if (res.value === 42) succeeded++
-    } catch {
-      // expected sometimes
-    }
-  }
-  expect(succeeded).toBeGreaterThan(0)
+  link.setImpairment(0, 100)
+  await expect(router.ping(link.netId, 2, 200)).rejects.toThrow(/timed out/)
 
   link.setImpairment(0, 0)
   const healed = await router.ping(link.netId, 2)

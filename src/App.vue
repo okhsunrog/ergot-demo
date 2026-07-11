@@ -6,6 +6,7 @@ import ErgotNode, { nodeName, type ErgotNodeData } from './components/ErgotNode.
 import FrameInspector from './components/FrameInspector.vue'
 import HelpModal from './components/HelpModal.vue'
 import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
+import { isTextEditingTarget } from '@/utils/keyboard'
 
 const store = useTopologyStore()
 const toast = useToast()
@@ -120,9 +121,10 @@ function deleteSelected() {
 }
 
 function onKeyDown(e: KeyboardEvent) {
-  if (e.key === 'Delete' || e.key === 'Backspace') {
-    deleteSelected()
-  }
+  if (e.key !== 'Delete' && e.key !== 'Backspace') return
+  if (isTextEditingTarget(e.target)) return
+  e.preventDefault()
+  deleteSelected()
 }
 
 // Help modal: shown automatically on the first visit
