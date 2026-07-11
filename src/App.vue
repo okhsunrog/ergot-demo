@@ -10,6 +10,7 @@ import { isTextEditingTarget } from '@/utils/keyboard'
 
 const store = useTopologyStore()
 const toast = useToast()
+const MAX_LATENCY_MS = 60_000
 
 const {
   fitView,
@@ -174,7 +175,7 @@ watch(selectedEdge, (edge) => {
 function applyImpairment() {
   const edge = selectedEdge.value
   if (!edge) return
-  latencyMs.value = Math.max(0, Math.floor(latencyMs.value) || 0)
+  latencyMs.value = Math.min(MAX_LATENCY_MS, Math.max(0, Math.floor(latencyMs.value) || 0))
   lossPct.value = Math.min(100, Math.max(0, Math.floor(lossPct.value) || 0))
   store.setImpairment(edge.id, latencyMs.value, lossPct.value)
 }
@@ -271,6 +272,8 @@ onUnmounted(() => {
               <UInput
                 v-model.number="latencyMs"
                 type="number"
+                :max="MAX_LATENCY_MS"
+                min="0"
                 size="xs"
                 class="w-16"
                 @change="applyImpairment"
