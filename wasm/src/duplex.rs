@@ -123,7 +123,9 @@ pub fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
     }));
 
     (
-        PipeWriter { inner: inner.clone() },
+        PipeWriter {
+            inner: inner.clone(),
+        },
         PipeReader { inner },
     )
 }

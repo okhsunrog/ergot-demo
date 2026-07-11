@@ -59,9 +59,7 @@ pub use frame_tap::{FrameEvent, FrameEventBatch, take_frame_events};
 use frame_tap::{Tap, TapBinding, TapLabel, WasmInterface, new_sink, next_link_generation};
 use impairment::{Impairment, spawn_packet_impairment, spawn_stream_impairment};
 use seed::spawn_seed_assign;
-use transport::{
-    StackSide, router_tx_half, spawn_packet_worker, spawn_stream_rx, spawn_stream_tx,
-};
+use transport::{StackSide, router_tx_half, spawn_packet_worker, spawn_stream_rx, spawn_stream_tx};
 
 // The demo's sensor stream: a plain f32 reading, fire-and-forget.
 ergot::topic!(SensorTopic, f32, "ergot-demo/sensor");
@@ -103,8 +101,14 @@ type RouterStack = ArcNetStack<
 enum Stack {
     Router(RouterStack),
     /// Router profile in bridge mode; `queue` feeds the upstream sink.
-    Bridge { stack: RouterStack, queue: StdQueue },
-    Edge { stack: EdgeStack, queue: StdQueue },
+    Bridge {
+        stack: RouterStack,
+        queue: StdQueue,
+    },
+    Edge {
+        stack: EdgeStack,
+        queue: StdQueue,
+    },
 }
 
 type LinkList = Rc<RefCell<Vec<Rc<LinkState>>>>;
@@ -184,7 +188,11 @@ pub struct PingResult {
 /// Current state of a node, for display on the canvas.
 #[derive(Serialize, Tsify)]
 #[tsify(into_wasm_abi)]
-#[serde(tag = "profile", rename_all = "lowercase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "profile",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum NodeStatus {
     /// Router: the network ids of its active downlinks.
     Router { nets: Vec<u16> },
@@ -254,9 +262,7 @@ impl WasmNode {
         let uplink_tap_label = Rc::new(RefCell::new(None));
         let services_closer = Arc::new(WaitQueue::new());
         let stack = match profile {
-            NodeProfile::Router => {
-                Stack::Router(RouterStack::new_with_profile(Router::new_std()))
-            }
+            NodeProfile::Router => Stack::Router(RouterStack::new_with_profile(Router::new_std())),
             NodeProfile::Bridge => {
                 let queue = new_std_queue(QUEUE_SIZE);
                 let sink = new_sink(
@@ -342,10 +348,7 @@ impl WasmNode {
                 )
             }),
             Stack::Edge { stack, .. } => stack.manage_profile(|im| {
-                matches!(
-                    im.interface_state(()),
-                    Some(InterfaceState::Down) | None
-                )
+                matches!(im.interface_state(()), Some(InterfaceState::Down) | None)
             }),
         }
     }
@@ -402,7 +405,11 @@ impl WasmNode {
     /// from the upstream seed router once their uplink is active. `link_id`
     /// is an opaque label (e.g. the canvas edge id) attached to tapped frames.
     #[wasm_bindgen(js_name = connectTo)]
-    pub fn connect_to(&self, target: &WasmNode, link_id: Option<String>) -> Result<WasmLink, JsError> {
+    pub fn connect_to(
+        &self,
+        target: &WasmNode,
+        link_id: Option<String>,
+    ) -> Result<WasmLink, JsError> {
         let parent = match &self.stack {
             Stack::Router(stack) | Stack::Bridge { stack, .. } => stack,
             Stack::Edge { .. } => {
@@ -786,7 +793,8 @@ impl WasmNode {
                             TimeoutFuture::new(interval).await;
                             let t = js_sys::Date::now() / 1000.0;
                             let value = ((t * core::f64::consts::TAU * 0.3).sin()
-                                + js_sys::Math::random() * 0.1) as f32;
+                                + js_sys::Math::random() * 0.1)
+                                as f32;
                             let _ = stack.topics().broadcast::<SensorTopic>(&value, None);
                         }
                     };
