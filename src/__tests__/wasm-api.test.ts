@@ -280,6 +280,56 @@ test('disconnect frees both sides and reconnect works', async () => {
   router.free()
 })
 
+test('freeing one endpoint removes the link from its peer', async () => {
+  const firstRouter = new WasmNode(NodeProfile.Router)
+  const secondRouter = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const oldLink = firstRouter.connectTo(edge, 'old-link')
+  await edge.servePing()
+
+  firstRouter.free()
+  await sleep(20)
+  expect(edge.linkCount).toBe(0)
+  expect(edge.uplinkFree).toBe(true)
+
+  const newLink = secondRouter.connectTo(edge, 'new-link')
+  expect(edge.linkCount).toBe(1)
+  // Releasing the stale JS handle must not affect the replacement link.
+  oldLink.free()
+  expect(edge.linkCount).toBe(1)
+  expect((await secondRouter.ping(newLink.netId, 2)).value).toBe(42)
+
+  newLink.free()
+  edge.free()
+  secondRouter.free()
+})
+
+test('an old disconnected handle cannot clear a replacement frame tap', async () => {
+  const firstRouter = new WasmNode(NodeProfile.Router)
+  const secondRouter = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge)
+  await edge.servePing()
+  const oldLink = firstRouter.connectTo(edge, 'old-link')
+
+  oldLink.disconnect()
+  await sleep(20)
+  const newLink = secondRouter.connectTo(edge, 'new-link')
+  await secondRouter.ping(newLink.netId, 2)
+  takeFrameEvents()
+
+  oldLink.disconnect()
+  await secondRouter.ping(newLink.netId, 2)
+  const events = takeFrameEvents().events.filter((event) => event.linkId === 'new-link')
+  expect(events.some((event) => event.dir === 'down' && event.kind === 'req')).toBe(true)
+  expect(events.some((event) => event.dir === 'up' && event.kind === 'resp')).toBe(true)
+
+  oldLink.free()
+  newLink.free()
+  edge.free()
+  firstRouter.free()
+  secondRouter.free()
+})
+
 test('sensor topic: broadcast fans out to all subscribers', async () => {
   const router = new WasmNode(NodeProfile.Router)
   const a = new WasmNode(NodeProfile.Edge)

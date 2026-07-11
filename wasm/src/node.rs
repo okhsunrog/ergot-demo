@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
@@ -101,6 +101,15 @@ const MAX_EVENTS: usize = 256;
 
 thread_local! {
     static FRAME_EVENTS: RefCell<VecDeque<FrameEvent>> = const { RefCell::new(VecDeque::new()) };
+    static NEXT_LINK_GENERATION: Cell<u64> = const { Cell::new(1) };
+}
+
+fn next_link_generation() -> u64 {
+    NEXT_LINK_GENERATION.with(|next| {
+        let generation = next.get();
+        next.set(generation.wrapping_add(1).max(1));
+        generation
+    })
 }
 
 /// Drain all frame events recorded since the last call. Poll this from the UI.
@@ -140,21 +149,29 @@ fn kind_name(kind: u8) -> String {
     }
 }
 
-/// A tap attached to one interface sink. `label` is the canvas edge id of
-/// the link the interface currently serves (None while disconnected).
+#[derive(Clone)]
+struct TapBinding {
+    generation: u64,
+    label: String,
+}
+
+type TapLabel = Rc<RefCell<Option<TapBinding>>>;
+
+/// A tap attached to one interface sink. `label` identifies the canvas edge
+/// currently served by the interface (None while disconnected).
 #[derive(Clone)]
 struct Tap {
-    label: Rc<RefCell<Option<String>>>,
+    label: TapLabel,
     dir: &'static str,
 }
 
 impl Tap {
     fn record(&self, hdr: &HeaderSeq) {
-        let Some(link_id) = self.label.borrow().clone() else {
+        let Some(binding) = self.label.borrow().clone() else {
             return;
         };
         let ev = FrameEvent {
-            link_id,
+            link_id: binding.label,
             dir: self.dir.into(),
             src: fmt_addr(&hdr.src),
             dst: fmt_addr(&hdr.dst),
@@ -239,6 +256,42 @@ enum Stack {
     /// Router profile in bridge mode; `queue` feeds the upstream sink.
     Bridge { stack: RouterStack, queue: StdQueue },
     Edge { stack: EdgeStack, queue: StdQueue },
+}
+
+type LinkList = Rc<RefCell<Vec<Rc<LinkState>>>>;
+
+/// Shared ownership record for one live link. Both endpoint nodes and the
+/// public `WasmLink` handle retain it, while endpoint references are weak so
+/// dropping a node cannot create a cycle.
+struct LinkState {
+    closer: Arc<WaitQueue>,
+    disconnected: Cell<bool>,
+    ends: [Weak<RefCell<Vec<Rc<LinkState>>>>; 2],
+    tap_labels: [TapLabel; 2],
+    generation: u64,
+}
+
+impl LinkState {
+    fn disconnect(self: &Rc<Self>) {
+        if self.disconnected.replace(true) {
+            return;
+        }
+        self.closer.close();
+        for end in &self.ends {
+            if let Some(end) = end.upgrade() {
+                end.borrow_mut().retain(|link| !Rc::ptr_eq(link, self));
+            }
+        }
+        for label in &self.tap_labels {
+            let owns_binding = label
+                .borrow()
+                .as_ref()
+                .is_some_and(|binding| binding.generation == self.generation);
+            if owns_binding {
+                *label.borrow_mut() = None;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,10 +427,10 @@ pub struct WasmNode {
     link_kind: LinkKind,
     /// Closes node-owned service tasks (ping server, ...) on drop.
     services_closer: Arc<WaitQueue>,
-    /// Closers of currently attached links. Shared with [`WasmLink`]s.
-    links: Rc<RefCell<Vec<Arc<WaitQueue>>>>,
+    /// Currently attached links. Shared with [`WasmLink`] handles.
+    links: LinkList,
     /// Edge/bridge nodes: the frame-tap label of the uplink sink, set while linked.
-    uplink_tap_label: Rc<RefCell<Option<String>>>,
+    uplink_tap_label: TapLabel,
     /// Sensor readings received by the subscriber task.
     samples: Rc<RefCell<VecDeque<SensorSample>>>,
     /// Closer of the running sensor publisher task, if any.
@@ -564,8 +617,9 @@ impl WasmNode {
 
         let closer = Arc::new(WaitQueue::new());
         let impairment = Impairment::default();
-        let parent_tap_label = Rc::new(RefCell::new(link_id.clone()));
-        *target.uplink_tap_label.borrow_mut() = link_id;
+        let generation = next_link_generation();
+        let binding = link_id.map(|label| TapBinding { generation, label });
+        let parent_tap_label = Rc::new(RefCell::new(binding.clone()));
 
         // Parent side: register a downlink interface. Routers assign a net id
         // immediately; bridge downlinks start pending until seed assignment.
@@ -592,6 +646,7 @@ impl WasmNode {
         let Some((ident, net_id, parent_state)) = res else {
             return Err(JsError::new("parent has no free interface slots"));
         };
+        *target.uplink_tap_label.borrow_mut() = binding;
 
         // Child side: mark the uplink interface up.
         let child_setup = match &target.stack {
@@ -624,7 +679,14 @@ impl WasmNode {
         };
         if let Err(e) = child_setup {
             closer.close();
-            *target.uplink_tap_label.borrow_mut() = None;
+            let owns_binding = target
+                .uplink_tap_label
+                .borrow()
+                .as_ref()
+                .is_some_and(|binding| binding.generation == generation);
+            if owns_binding {
+                *target.uplink_tap_label.borrow_mut() = None;
+            }
             parent.manage_profile(|im| {
                 let _ = im.deregister_interface(ident);
             });
@@ -692,15 +754,30 @@ impl WasmNode {
             spawn_seed_assign(parent.clone(), ident, closer.clone());
         }
 
-        self.links.borrow_mut().push(closer.clone());
-        target.links.borrow_mut().push(closer.clone());
+        let state = Rc::new(LinkState {
+            closer: closer.clone(),
+            disconnected: Cell::new(false),
+            ends: [Rc::downgrade(&self.links), Rc::downgrade(&target.links)],
+            tap_labels: [parent_tap_label, target.uplink_tap_label.clone()],
+            generation,
+        });
+        self.links.borrow_mut().push(state.clone());
+        target.links.borrow_mut().push(state.clone());
+
+        // Transport workers close the shared closer on EOF/error. Reflect
+        // that asynchronous shutdown in both endpoint registries as well.
+        let weak_state = Rc::downgrade(&state);
+        spawn_local(async move {
+            let _ = closer.wait().await;
+            if let Some(state) = weak_state.upgrade() {
+                state.disconnect();
+            }
+        });
 
         Ok(WasmLink {
-            closer,
+            state,
             net_id,
             kind,
-            ends: [self.links.clone(), target.links.clone()],
-            tap_labels: [parent_tap_label, target.uplink_tap_label.clone()],
             impairment,
         })
     }
@@ -937,8 +1014,9 @@ impl Drop for WasmNode {
         if let Some(closer) = self.publisher_closer.borrow_mut().take() {
             closer.close();
         }
-        for closer in self.links.borrow_mut().drain(..) {
-            closer.close();
+        let links = core::mem::take(&mut *self.links.borrow_mut());
+        for link in links {
+            link.disconnect();
         }
     }
 }
@@ -952,11 +1030,9 @@ impl Drop for WasmNode {
 /// returns to Down and the router frees the interface slot.
 #[wasm_bindgen]
 pub struct WasmLink {
-    closer: Arc<WaitQueue>,
+    state: Rc<LinkState>,
     net_id: u16,
     kind: LinkKind,
-    ends: [Rc<RefCell<Vec<Arc<WaitQueue>>>>; 2],
-    tap_labels: [Rc<RefCell<Option<String>>>; 2],
     impairment: Impairment,
 }
 
@@ -994,13 +1070,7 @@ impl WasmLink {
     }
 
     pub fn disconnect(&self) {
-        self.closer.close();
-        for end in &self.ends {
-            end.borrow_mut().retain(|c| !Arc::ptr_eq(c, &self.closer));
-        }
-        for label in &self.tap_labels {
-            *label.borrow_mut() = None;
-        }
+        self.state.disconnect();
     }
 }
 
