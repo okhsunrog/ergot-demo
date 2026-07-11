@@ -25,7 +25,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel};
 use futures_core::Stream;
 use gloo_timers::future::TimeoutFuture;
 use maitake_sync::WaitQueue;
@@ -67,6 +67,8 @@ const QUEUE_SIZE: usize = 4096;
 const BUF_SIZE: usize = 2048;
 const MAX_INTERFACES: usize = 16;
 const MAX_SEEDS: usize = 16;
+const PACKET_QUEUE_FRAMES: usize = 16;
+const MAX_LATENCY_MS: u32 = 60_000;
 
 // ---------------------------------------------------------------------------
 // Frame tap: every frame leaving any interface is recorded for the UI
@@ -305,7 +307,7 @@ struct LinkClosed;
 /// complete ergot frame. `recv` also watches the link closer, which is how
 /// packet workers get torn down (`PacketRxTxWorker` has no closer input).
 struct ChannelRx {
-    rx: UnboundedReceiver<Vec<u8>>,
+    rx: MpscReceiver<Vec<u8>>,
     closer: Arc<WaitQueue>,
 }
 
@@ -325,14 +327,25 @@ impl PacketReceiver for ChannelRx {
 }
 
 struct ChannelTx {
-    tx: UnboundedSender<Vec<u8>>,
+    tx: MpscSender<Vec<u8>>,
+    overflow_drops: Rc<Cell<u32>>,
 }
 
 impl PacketSender for ChannelTx {
     type Error = LinkClosed;
 
     async fn send(&mut self, data: &[u8]) -> Result<(), LinkClosed> {
-        self.tx.unbounded_send(data.to_vec()).map_err(|_| LinkClosed)
+        match self.tx.try_send(data.to_vec()) {
+            Ok(()) => Ok(()),
+            // A full simulated link buffer drops the frame instead of
+            // growing browser memory or tearing the interface down.
+            Err(e) if e.is_full() => {
+                self.overflow_drops
+                    .set(self.overflow_drops.get().saturating_add(1));
+                Ok(())
+            }
+            Err(_) => Err(LinkClosed),
+        }
     }
 }
 
@@ -707,10 +720,10 @@ impl WasmNode {
         match kind {
             LinkKind::Stream => {
                 // Per direction: tx → pipe a → impairment forwarder → pipe b → rx.
-                let (parent_writer, down_tap) = duplex::pipe();
-                let (down_out, child_reader) = duplex::pipe();
-                let (child_writer, up_tap) = duplex::pipe();
-                let (up_out, parent_reader) = duplex::pipe();
+                let (parent_writer, down_tap) = duplex::pipe(QUEUE_SIZE);
+                let (down_out, child_reader) = duplex::pipe(QUEUE_SIZE);
+                let (child_writer, up_tap) = duplex::pipe(QUEUE_SIZE);
+                let (up_out, parent_reader) = duplex::pipe(QUEUE_SIZE);
                 spawn_stream_impairment(down_tap, down_out, impairment.clone(), closer.clone());
                 spawn_stream_impairment(up_tap, up_out, impairment.clone(), closer.clone());
 
@@ -721,17 +734,17 @@ impl WasmNode {
             }
             LinkKind::Packet => {
                 // Per direction: worker → channel a → impairment forwarder → channel b → worker.
-                let (parent_tx, down_tap) = unbounded();
-                let (down_out, child_chan_rx) = unbounded();
-                let (child_tx, up_tap) = unbounded();
-                let (up_out, parent_chan_rx) = unbounded();
+                let (parent_tx, down_tap) = channel(PACKET_QUEUE_FRAMES);
+                let (down_out, child_chan_rx) = channel(PACKET_QUEUE_FRAMES);
+                let (child_tx, up_tap) = channel(PACKET_QUEUE_FRAMES);
+                let (up_out, parent_chan_rx) = channel(PACKET_QUEUE_FRAMES);
                 spawn_packet_impairment(down_tap, down_out, impairment.clone(), closer.clone());
                 spawn_packet_impairment(up_tap, up_out, impairment.clone(), closer.clone());
 
                 spawn_packet_worker(
                     parent_rx,
                     parent_chan_rx,
-                    router_tx_half(parent_tx),
+                    router_tx_half(parent_tx, &impairment),
                     parent_queue.clone(),
                     parent_state,
                     closer.clone(),
@@ -739,7 +752,7 @@ impl WasmNode {
                 spawn_packet_worker(
                     child_rx,
                     child_chan_rx,
-                    router_tx_half(child_tx),
+                    router_tx_half(child_tx, &impairment),
                     child_queue,
                     child_state,
                     closer.clone(),
@@ -1062,10 +1075,18 @@ impl WasmLink {
         self.impairment.loss_pct.get()
     }
 
+    /// Frames dropped because a bounded packet-link buffer was full.
+    #[wasm_bindgen(getter, js_name = overflowDrops)]
+    pub fn overflow_drops(&self) -> u32 {
+        self.impairment.overflow_drops.get()
+    }
+
     /// Set artificial latency and loss for both directions of this link.
     #[wasm_bindgen(js_name = setImpairment)]
     pub fn set_impairment(&self, latency_ms: u32, loss_pct: u8) {
-        self.impairment.latency_ms.set(latency_ms);
+        self.impairment
+            .latency_ms
+            .set(latency_ms.min(MAX_LATENCY_MS));
         self.impairment.loss_pct.set(loss_pct.min(100));
     }
 
@@ -1092,8 +1113,11 @@ fn new_sink(kind: LinkKind, queue: &StdQueue, tap: Tap) -> WasmSink {
     WasmSink { inner, tap }
 }
 
-fn router_tx_half(tx: UnboundedSender<Vec<u8>>) -> ChannelTx {
-    ChannelTx { tx }
+fn router_tx_half(tx: MpscSender<Vec<u8>>, impairment: &Impairment) -> ChannelTx {
+    ChannelTx {
+        tx,
+        overflow_drops: impairment.overflow_drops.clone(),
+    }
 }
 
 /// One side of a link, for transport worker spawning.
@@ -1154,7 +1178,7 @@ fn spawn_stream_tx(writer: duplex::PipeWriter, queue: StdQueue, closer: Arc<Wait
 
 fn spawn_packet_worker(
     side: StackSide,
-    rx: UnboundedReceiver<Vec<u8>>,
+    rx: MpscReceiver<Vec<u8>>,
     tx: ChannelTx,
     queue: StdQueue,
     initial_state: InterfaceState,
@@ -1308,17 +1332,23 @@ fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQueue>) {
 struct Impairment {
     latency_ms: Rc<Cell<u32>>,
     loss_pct: Rc<Cell<u8>>,
+    overflow_drops: Rc<Cell<u32>>,
 }
 
 impl Impairment {
     /// Apply the configured delay, then decide whether to drop this unit.
-    async fn delay_and_drop(&self) -> bool {
+    async fn delay_and_drop(&self, closer: &WaitQueue) -> Option<bool> {
         let latency = self.latency_ms.get();
-        if latency > 0 {
-            TimeoutFuture::new(latency).await;
+        if latency > 0
+            && matches!(
+                select(TimeoutFuture::new(latency), closer.wait()).await,
+                Either::Second(_)
+            )
+        {
+            return None;
         }
         let loss = self.loss_pct.get();
-        loss > 0 && js_sys::Math::random() * 100.0 < f64::from(loss)
+        Some(loss > 0 && js_sys::Math::random() * 100.0 < f64::from(loss))
     }
 }
 
@@ -1354,8 +1384,10 @@ fn spawn_stream_impairment(
                 Either::First(Ok(n)) if n > 0 => n,
                 _ => return,
             };
-            if impairment.delay_and_drop().await {
-                continue;
+            match impairment.delay_and_drop(&closer).await {
+                Some(true) => continue,
+                Some(false) => {}
+                None => return,
             }
             if pipe_write_all(&mut tx, &buf[..n]).await.is_err() {
                 return;
@@ -1366,8 +1398,8 @@ fn spawn_stream_impairment(
 
 /// Forward frames between two channels, applying latency/loss per frame.
 fn spawn_packet_impairment(
-    mut rx: UnboundedReceiver<Vec<u8>>,
-    tx: UnboundedSender<Vec<u8>>,
+    mut rx: MpscReceiver<Vec<u8>>,
+    mut tx: MpscSender<Vec<u8>>,
     impairment: Impairment,
     closer: Arc<WaitQueue>,
 ) {
@@ -1378,11 +1410,17 @@ fn spawn_packet_impairment(
                 Either::First(Some(frame)) => frame,
                 _ => return,
             };
-            if impairment.delay_and_drop().await {
-                continue;
+            match impairment.delay_and_drop(&closer).await {
+                Some(true) => continue,
+                Some(false) => {}
+                None => return,
             }
-            if tx.unbounded_send(frame).is_err() {
-                return;
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(e) if e.is_full() => impairment
+                    .overflow_drops
+                    .set(impairment.overflow_drops.get().saturating_add(1)),
+                Err(_) => return,
             }
         }
     });

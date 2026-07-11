@@ -11,8 +11,11 @@ use std::task::{Context, Poll, Waker};
 
 struct PipeInner {
     buf: VecDeque<u8>,
-    waker: Option<Waker>,
-    closed: bool,
+    capacity: usize,
+    reader_waker: Option<Waker>,
+    writer_waker: Option<Waker>,
+    writer_closed: bool,
+    reader_closed: bool,
 }
 
 pub struct PipeReader {
@@ -31,35 +34,55 @@ impl futures_io::AsyncRead for PipeReader {
     ) -> Poll<io::Result<usize>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.buf.is_empty() {
-            if inner.closed {
+            if inner.writer_closed {
                 return Poll::Ready(Ok(0)); // EOF
             }
-            inner.waker = Some(cx.waker().clone());
+            inner.reader_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
         let len = buf.len().min(inner.buf.len());
         for (i, byte) in inner.buf.drain(..len).enumerate() {
             buf[i] = byte;
         }
+        if let Some(waker) = inner.writer_waker.take() {
+            waker.wake();
+        }
         Poll::Ready(Ok(len))
+    }
+}
+
+impl Drop for PipeReader {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reader_closed = true;
+        inner.buf.clear();
+        if let Some(waker) = inner.writer_waker.take() {
+            waker.wake();
+        }
     }
 }
 
 impl futures_io::AsyncWrite for PipeWriter {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
+        if inner.reader_closed || inner.writer_closed {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
         }
-        inner.buf.extend(buf);
-        if let Some(waker) = inner.waker.take() {
+        let available = inner.capacity.saturating_sub(inner.buf.len());
+        if available == 0 {
+            inner.writer_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let len = available.min(buf.len());
+        inner.buf.extend(&buf[..len]);
+        if let Some(waker) = inner.reader_waker.take() {
             waker.wake();
         }
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(len))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -68,8 +91,8 @@ impl futures_io::AsyncWrite for PipeWriter {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut inner = self.inner.lock().unwrap();
-        inner.closed = true;
-        if let Some(waker) = inner.waker.take() {
+        inner.writer_closed = true;
+        if let Some(waker) = inner.reader_waker.take() {
             waker.wake();
         }
         Poll::Ready(Ok(()))
@@ -79,19 +102,24 @@ impl futures_io::AsyncWrite for PipeWriter {
 impl Drop for PipeWriter {
     fn drop(&mut self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.closed = true;
-        if let Some(waker) = inner.waker.take() {
+        inner.writer_closed = true;
+        if let Some(waker) = inner.reader_waker.take() {
             waker.wake();
         }
     }
 }
 
-/// Create a unidirectional pipe. Data written to `PipeWriter` is readable from `PipeReader`.
-pub fn pipe() -> (PipeWriter, PipeReader) {
+/// Create a bounded unidirectional pipe. Writes wait while `capacity` bytes
+/// are buffered, propagating backpressure to the transport worker.
+pub fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
+    assert!(capacity > 0, "pipe capacity must be non-zero");
     let inner = Arc::new(Mutex::new(PipeInner {
         buf: VecDeque::new(),
-        waker: None,
-        closed: false,
+        capacity,
+        reader_waker: None,
+        writer_waker: None,
+        writer_closed: false,
+        reader_closed: false,
     }));
 
     (

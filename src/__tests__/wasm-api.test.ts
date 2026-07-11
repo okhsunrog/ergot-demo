@@ -112,6 +112,27 @@ test('packet link: ping over a frame-channel uplink', async () => {
   router.free()
 })
 
+test('packet link: bounded buffers drop overflow without closing the link', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const link = router.connectTo(edge)
+  await edge.servePing()
+  await router.ping(link.netId, 2)
+
+  link.setImpairment(1_000, 0)
+  for (let i = 0; i < 64; i++) {
+    router.publishSensor(i)
+    await sleep(0)
+  }
+  expect(link.overflowDrops).toBeGreaterThan(0)
+  expect(router.linkCount).toBe(1)
+  expect(edge.linkCount).toBe(1)
+
+  link.free()
+  edge.free()
+  router.free()
+})
+
 test('mixed kinds: stream edge pings packet edge across one router', async () => {
   const router = new WasmNode(NodeProfile.Router)
   const streamy = new WasmNode(NodeProfile.Edge, LinkKind.Stream)
@@ -220,6 +241,9 @@ test('impairment: latency raises RTT, full loss kills the link', async () => {
 
   const fast = await router.ping(link.netId, 2)
   expect(fast.latencyMs).toBeLessThan(50)
+
+  link.setImpairment(100_000, 0)
+  expect(link.latencyMs).toBe(60_000)
 
   link.setImpairment(100, 0)
   expect(link.latencyMs).toBe(100)
