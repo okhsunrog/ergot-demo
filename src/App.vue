@@ -235,6 +235,7 @@ onMounted(async () => {
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
   if (frameTimer) clearInterval(frameTimer)
+  store.dispose()
 })
 </script>
 

@@ -18,6 +18,7 @@ export type LinkKindType = 'stream' | 'packet'
 // WASM handles are plain pointers — keep them out of Vue's reactivity.
 const nodeHandles = new Map<string, WasmNode>()
 const linkHandles = new Map<string, WasmLink>()
+const linkEndpoints = new Map<string, { sourceId: string; targetId: string }>()
 
 function toWasmProfile(profile: ProfileType): NodeProfile {
   if (profile === 'router') return NodeProfile.Router
@@ -119,7 +120,9 @@ export const useTopologyStore = defineStore('topology', () => {
   }
 
   function destroyNode(id: string) {
-    // Freeing the node closes its links; drop our link handles for them too.
+    for (const [edgeId, endpoints] of linkEndpoints) {
+      if (endpoints.sourceId === id || endpoints.targetId === id) disconnect(edgeId)
+    }
     nodeHandles.get(id)?.free()
     nodeHandles.delete(id)
     delete statuses[id]
@@ -149,6 +152,7 @@ export const useTopologyStore = defineStore('topology', () => {
     if (!source || !target) throw new Error('unknown node')
     const link = source.connectTo(target, edgeId)
     linkHandles.set(edgeId, link)
+    linkEndpoints.set(edgeId, { sourceId, targetId })
     // Warm the link with one ping so the child learns its address. Pending
     // bridge downlinks (netId 0) warm themselves after seed assignment.
     if (link.netId > 0) {
@@ -168,6 +172,20 @@ export const useTopologyStore = defineStore('topology', () => {
   function disconnect(edgeId: string) {
     linkHandles.get(edgeId)?.free()
     linkHandles.delete(edgeId)
+    linkEndpoints.delete(edgeId)
+  }
+
+  /** Tear down every live WASM handle and clear all topology state. */
+  function dispose() {
+    for (const edgeId of linkHandles.keys()) disconnect(edgeId)
+    for (const node of nodeHandles.values()) node.free()
+    nodeHandles.clear()
+    for (const id of Object.keys(statuses)) delete statuses[id]
+    for (const id of Object.keys(linkCounts)) delete linkCounts[id]
+    for (const id of Object.keys(sensorData)) delete sensorData[id]
+    for (const id of Object.keys(publishing)) delete publishing[id]
+    for (const id of Object.keys(linkActivity)) delete linkActivity[id]
+    frames.value = []
   }
 
   /** Replace a node's stack with a different profile. Only valid when unlinked. */
@@ -241,6 +259,7 @@ export const useTopologyStore = defineStore('topology', () => {
     canConnect,
     connect,
     disconnect,
+    dispose,
     setProfile,
     setLinkKind,
     ping,
