@@ -3,9 +3,10 @@
 //! A [`WasmNode`] owns one ergot NetStack with a profile chosen at
 //! construction: a `Router` (many downlinks, each its own network segment)
 //! or a DirectEdge `Edge` (single uplink). [`WasmNode::connect_to`] wires a
-//! router to an edge and spawns the transport workers; the returned
-//! [`WasmLink`] tears everything down on `disconnect()`/`free()`. Freeing a
-//! node stops its service tasks and all attached links.
+//! point-to-point link, while [`WasmBus`] puts one router and multiple edges
+//! on a shared packet segment. The returned [`WasmLink`] handles tear their
+//! attachment down on `disconnect()`/`free()`. Freeing a node stops its
+//! service tasks and all attached links.
 //!
 //! Links come in two kinds, mirroring ergot's two interface flavors:
 //!
@@ -50,11 +51,13 @@ use mutex::raw_impls::cs::CriticalSectionRawMutex;
 
 use crate::duplex;
 
+mod bus;
 mod frame_tap;
 mod impairment;
 mod seed;
 mod transport;
 
+pub use bus::WasmBus;
 pub use frame_tap::{FrameEvent, FrameEventBatch, take_frame_events};
 use frame_tap::{Tap, TapBinding, TapLabel, WasmInterface, new_sink, next_link_generation};
 use impairment::{Impairment, spawn_packet_impairment, spawn_stream_impairment};
@@ -70,6 +73,7 @@ const QUEUE_SIZE: usize = 4096;
 const BUF_SIZE: usize = 2048;
 const MAX_INTERFACES: usize = 16;
 const MAX_SEEDS: usize = 16;
+const MAX_CLAIMS: usize = 64;
 const PACKET_QUEUE_FRAMES: usize = 16;
 const MAX_LATENCY_MS: u32 = 60_000;
 
@@ -95,7 +99,7 @@ fn push_sample(
 type EdgeStack = ArcNetStack<CriticalSectionRawMutex, DirectEdge<WasmInterface>>;
 type RouterStack = ArcNetStack<
     CriticalSectionRawMutex,
-    Router<WasmInterface, rand::rngs::StdRng, MAX_INTERFACES, MAX_SEEDS>,
+    Router<WasmInterface, rand::rngs::StdRng, MAX_INTERFACES, MAX_SEEDS, MAX_CLAIMS>,
 >;
 
 enum Stack {
@@ -113,15 +117,16 @@ enum Stack {
 
 type LinkList = Rc<RefCell<Vec<Rc<LinkState>>>>;
 
-/// Shared ownership record for one live link. Both endpoint nodes and the
-/// public `WasmLink` handle retain it, while endpoint references are weak so
-/// dropping a node cannot create a cycle.
+/// Shared ownership record for one live attachment. Its endpoint node(s), a
+/// possible bus, and the public `WasmLink` retain it, while endpoint references
+/// are weak so dropping a node or bus cannot create a cycle.
 struct LinkState {
     closer: Arc<WaitQueue>,
     disconnected: Cell<bool>,
-    ends: [Weak<RefCell<Vec<Rc<LinkState>>>>; 2],
-    tap_labels: [TapLabel; 2],
+    ends: Vec<Weak<RefCell<Vec<Rc<LinkState>>>>>,
+    tap_labels: Vec<TapLabel>,
     generation: u64,
+    on_disconnect: Option<Box<dyn Fn()>>,
 }
 
 impl LinkState {
@@ -143,6 +148,9 @@ impl LinkState {
             if owns_binding {
                 *label.borrow_mut() = None;
             }
+        }
+        if let Some(on_disconnect) = &self.on_disconnect {
+            on_disconnect();
         }
     }
 }
@@ -250,6 +258,9 @@ pub struct WasmNode {
     samples: Rc<RefCell<VecDeque<SensorSample>>>,
     /// Closer of the running sensor publisher task, if any.
     publisher_closer: RefCell<Option<Arc<WaitQueue>>>,
+    /// Stable identity used to reclaim the same bus node_id after reconnects.
+    bus_nonce: u64,
+    bus_candidate: u8,
 }
 
 #[wasm_bindgen]
@@ -259,6 +270,8 @@ impl WasmNode {
     #[wasm_bindgen(constructor)]
     pub fn new(profile: NodeProfile, link_kind: Option<LinkKind>) -> WasmNode {
         let link_kind = link_kind.unwrap_or(LinkKind::Stream);
+        let bus_nonce = next_link_generation();
+        let bus_candidate = 3 + (bus_nonce % 252) as u8;
         let uplink_tap_label = Rc::new(RefCell::new(None));
         let services_closer = Arc::new(WaitQueue::new());
         let stack = match profile {
@@ -311,6 +324,16 @@ impl WasmNode {
                 .await;
             });
         }
+        // Root routers also lease unique node_ids to devices sharing one bus
+        // interface. Bridges are excluded for now: demo buses deliberately
+        // have a root router as their controller.
+        if let Stack::Router(stack) = &stack {
+            let stack = stack.clone();
+            let closer = services_closer.clone();
+            spawn_local(async move {
+                let _ = select(stack.services().address_claim_handler::<8>(), closer.wait()).await;
+            });
+        }
         WasmNode {
             stack,
             profile,
@@ -320,6 +343,8 @@ impl WasmNode {
             uplink_tap_label,
             samples: Rc::new(RefCell::new(VecDeque::new())),
             publisher_closer: RefCell::new(None),
+            bus_nonce,
+            bus_candidate,
         }
     }
 
@@ -575,9 +600,10 @@ impl WasmNode {
         let state = Rc::new(LinkState {
             closer: closer.clone(),
             disconnected: Cell::new(false),
-            ends: [Rc::downgrade(&self.links), Rc::downgrade(&target.links)],
-            tap_labels: [parent_tap_label, target.uplink_tap_label.clone()],
+            ends: vec![Rc::downgrade(&self.links), Rc::downgrade(&target.links)],
+            tap_labels: vec![parent_tap_label, target.uplink_tap_label.clone()],
             generation,
+            on_disconnect: None,
         });
         self.links.borrow_mut().push(state.clone());
         target.links.borrow_mut().push(state.clone());
@@ -844,9 +870,10 @@ impl Drop for WasmNode {
 // WasmLink
 // ---------------------------------------------------------------------------
 
-/// A live link between a router and an edge node. `disconnect()` (or
-/// `free()`) tears down the transport workers on both sides; the edge
-/// returns to Down and the router frees the interface slot.
+/// A live point-to-point link or one member attachment to a shared bus.
+/// `disconnect()` (or `free()`) tears down its transport workers; an edge
+/// returns to Down and a point-to-point/router-bus controller frees its
+/// router interface slot.
 #[wasm_bindgen]
 pub struct WasmLink {
     state: Rc<LinkState>,

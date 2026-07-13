@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
 use ergot::interface_manager::{
-    InterfaceState,
+    FrameProcessor, InterfaceState, Profile,
     profiles::{
         direct_edge::EdgeFrameProcessor,
         router::{RouterFrameProcessor, UPSTREAM_IDENT},
@@ -16,6 +16,7 @@ use ergot::interface_manager::{
     },
     utils::std::StdQueue,
 };
+use ergot::wire_frames::de_frame;
 use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use futures_core::Stream;
 use maitake_sync::WaitQueue;
@@ -89,6 +90,44 @@ pub(super) enum StackSide {
     BridgeUp(RouterStack),
     /// Edge uplink.
     Edge(EdgeStack),
+    /// Edge attached to a shared bus. Frames for other bus members must be
+    /// rejected before they reach the point-to-point DirectEdge processor.
+    BusEdge(EdgeStack),
+}
+
+struct BusEdgeFrameProcessor {
+    inner: EdgeFrameProcessor,
+}
+
+impl BusEdgeFrameProcessor {
+    fn new() -> Self {
+        Self {
+            inner: EdgeFrameProcessor::new(),
+        }
+    }
+}
+
+impl FrameProcessor<EdgeStack> for BusEdgeFrameProcessor {
+    fn process_frame(&mut self, data: &[u8], stack: &EdgeStack, ident: ()) -> bool {
+        let Some(frame) = de_frame(data) else {
+            return self.inner.process_frame(data, stack, ident);
+        };
+        let own_node = stack.manage_profile(|profile| match profile.interface_state(()) {
+            Some(InterfaceState::Active { node_id, .. })
+            | Some(InterfaceState::ActiveLocal { node_id }) => Some(node_id),
+            _ => None,
+        });
+        let addressed_to_us = own_node == Some(frame.hdr.dst.node_id);
+        let broadcast = frame.hdr.dst.port_id == 255 || frame.hdr.dst.node_id == 255;
+        if !addressed_to_us && !broadcast {
+            return false;
+        }
+        self.inner.process_frame(data, stack, ident)
+    }
+
+    fn reset(&mut self) {
+        <EdgeFrameProcessor as FrameProcessor<EdgeStack>>::reset(&mut self.inner);
+    }
 }
 
 pub(super) fn spawn_stream_rx(side: StackSide, reader: duplex::PipeReader, closer: Arc<WaitQueue>) {
@@ -124,6 +163,12 @@ pub(super) fn spawn_stream_rx(side: StackSide, reader: duplex::PipeReader, close
                 let _ = rx_worker.run(&mut frame, &mut scratch).await;
                 closer.close();
             }
+            StackSide::BusEdge(stack) => {
+                let mut rx_worker = RxWorker::new(stack, reader, BusEdgeFrameProcessor::new(), ())
+                    .with_closer(closer.clone());
+                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                closer.close();
+            }
         }
     });
 }
@@ -137,14 +182,16 @@ pub(super) fn spawn_stream_tx(writer: duplex::PipeWriter, queue: StdQueue, close
     });
 }
 
-pub(super) fn spawn_packet_worker(
+pub(super) fn spawn_packet_worker<T>(
     side: StackSide,
     rx: MpscReceiver<Vec<u8>>,
-    tx: ChannelTx,
+    tx: T,
     queue: StdQueue,
     initial_state: InterfaceState,
     closer: Arc<WaitQueue>,
-) {
+) where
+    T: PacketSender + 'static,
+{
     let receiver = ChannelRx {
         rx,
         closer: closer.clone(),
@@ -187,6 +234,18 @@ pub(super) fn spawn_packet_worker(
                     receiver,
                     tx,
                     EdgeFrameProcessor::new(),
+                    (),
+                    consumer,
+                );
+                let _ = worker.run(initial_state, &mut scratch).await;
+                closer.close();
+            }
+            StackSide::BusEdge(stack) => {
+                let mut worker = PacketRxTxWorker::new(
+                    stack,
+                    receiver,
+                    tx,
+                    BusEdgeFrameProcessor::new(),
                     (),
                     consumer,
                 );

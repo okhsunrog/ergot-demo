@@ -8,6 +8,7 @@ import {
   LinkKind,
   NodeProfile,
   takeFrameEvents,
+  WasmBus,
   WasmNode,
 } from '../wasm-pkg/ergot_demo_wasm'
 
@@ -152,6 +153,71 @@ test('mixed kinds: stream edge pings packet edge across one router', async () =>
   linkS.free()
   linkP.free()
   for (const n of [router, streamy, packety]) n.free()
+})
+
+test('shared bus: multiple devices claim unique node ids on one network', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const a = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const b = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const bus = new WasmBus()
+  await a.servePing()
+  await b.servePing()
+  await a.subscribeSensor()
+  await b.subscribeSensor()
+
+  const routerLink = bus.attachRouter(router, 'bus-router')
+  const linkA = bus.attachEdge(a, 'bus-a')
+  const linkB = bus.attachEdge(b, 'bus-b')
+
+  await waitFor(() => edgeStatus(a).status === 'active' && (edgeStatus(a).netId ?? 0) > 0)
+  await waitFor(() => edgeStatus(b).status === 'active' && (edgeStatus(b).netId ?? 0) > 0)
+
+  const statusA = edgeStatus(a)
+  const statusB = edgeStatus(b)
+  expect(statusA.netId).toBe(routerLink.netId)
+  expect(statusB.netId).toBe(routerLink.netId)
+  expect(statusA.nodeId).toBeGreaterThanOrEqual(3)
+  expect(statusB.nodeId).toBeGreaterThanOrEqual(3)
+  expect(statusA.nodeId).not.toBe(statusB.nodeId)
+  expect(router.status()).toEqual({ profile: 'router', nets: [routerLink.netId] })
+  expect(bus.memberCount).toBe(3)
+
+  expect((await router.ping(routerLink.netId, statusA.nodeId!)).value).toBe(42)
+  expect((await router.ping(routerLink.netId, statusB.nodeId!)).value).toBe(42)
+  expect((await a.ping(routerLink.netId, statusB.nodeId!)).value).toBe(42)
+
+  router.publishSensor(12.5)
+  await sleep(50)
+  expect(a.takeSamples().samples.some((sample) => sample.value === 12.5)).toBe(true)
+  expect(b.takeSamples().samples.some((sample) => sample.value === 12.5)).toBe(true)
+
+  linkA.free()
+  await waitFor(() => a.linkCount === 0)
+  expect(bus.memberCount).toBe(2)
+  expect((await router.ping(routerLink.netId, statusB.nodeId!)).value).toBe(42)
+
+  linkB.free()
+  routerLink.free()
+  bus.free()
+  for (const node of [router, a, b]) node.free()
+})
+
+test('shared bus: validates controller, transport, and attachment order', () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const bridge = new WasmNode(NodeProfile.Bridge)
+  const streamEdge = new WasmNode(NodeProfile.Edge)
+  const packetEdge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const bus = new WasmBus()
+
+  expect(() => bus.attachEdge(packetEdge)).toThrow(/Router.*first/)
+  expect(() => bus.attachRouter(bridge)).toThrow(/root Router/)
+  const routerLink = bus.attachRouter(router)
+  expect(() => bus.attachRouter(router)).toThrow(/already has a router/)
+  expect(() => bus.attachEdge(streamEdge)).toThrow(/Packet transport/)
+
+  routerLink.free()
+  bus.free()
+  for (const node of [router, bridge, streamEdge, packetEdge]) node.free()
 })
 
 test('packet link: disconnect and reconnect', async () => {

@@ -44,10 +44,16 @@ const open = defineModel<boolean>('open', { required: true })
             for its downlinks from the upstream seed router (the <b>nets</b> on its card appear only
             after its uplink comes alive).
           </li>
+          <li>
+            <b>Shared bus:</b> add a Bus, connect <b>Router → Bus</b>, then fan out
+            <b>Bus → Packet Edge</b>. Every device shares one network id and claims a unique node id
+            at runtime, just like devices on CAN FD, RS-485, or a simple radio medium.
+          </li>
         </ul>
         <p class="text-(--ui-text-muted)">
           Addresses appear on cards as nodes learn them (<span class="font-mono">net.node</span>).
-          Dashed links are packet transports. Source:
+          Dashed links are packet transports. Latency/loss selected on any bus leg applies to the
+          whole shared medium. Source:
           <a
             href="https://github.com/okhsunrog/ergot-demo"
             target="_blank"

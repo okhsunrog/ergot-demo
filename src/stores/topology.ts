@@ -5,6 +5,7 @@ import init, {
   LinkKind,
   NodeProfile,
   takeFrameEvents,
+  WasmBus,
   WasmNode,
   WasmLink,
   type FrameEvent,
@@ -14,11 +15,17 @@ import init, {
 
 export type ProfileType = 'router' | 'bridge' | 'edge'
 export type LinkKindType = 'stream' | 'packet'
+export interface BusStatus {
+  routerAttached: boolean
+  netId: number
+  deviceCount: number
+}
 
 // WASM handles are plain pointers — keep them out of Vue's reactivity.
 const nodeHandles = new Map<string, WasmNode>()
+const busHandles = new Map<string, WasmBus>()
 const linkHandles = new Map<string, WasmLink>()
-const linkEndpoints = new Map<string, { sourceId: string; targetId: string }>()
+const linkEndpoints = new Map<string, { sourceId: string; targetId: string; busId?: string }>()
 
 function toWasmProfile(profile: ProfileType): NodeProfile {
   if (profile === 'router') return NodeProfile.Router
@@ -40,6 +47,7 @@ const MAX_FRAMES = 100
 export const useTopologyStore = defineStore('topology', () => {
   const ready = ref(false)
   const statuses = reactive<Record<string, NodeStatus>>({})
+  const busStatuses = reactive<Record<string, BusStatus>>({})
   /** Attached-link counts per node id (drives UI locking of selects). */
   const linkCounts = reactive<Record<string, number>>({})
   /** Recent tapped frames, newest last. */
@@ -67,13 +75,31 @@ export const useTopologyStore = defineStore('topology', () => {
 
   function refreshAll() {
     for (const id of nodeHandles.keys()) refresh(id)
+    for (const id of busHandles.keys()) refreshBus(id)
+  }
+
+  function refreshBus(id: string) {
+    const bus = busHandles.get(id)
+    if (!bus) return
+    busStatuses[id] = {
+      routerAttached: bus.routerAttached,
+      netId: bus.netId,
+      deviceCount: Math.max(0, bus.memberCount - (bus.routerAttached ? 1 : 0)),
+    }
   }
 
   /** Drain tapped frames from the WASM side into the reactive log. */
   function pollFrames() {
     const { events } = takeFrameEvents()
     if (!events.length) return
-    for (const e of events) linkActivity[e.linkId] = e.ts
+    for (const e of events) {
+      linkActivity[e.linkId] = e.ts
+      const busId = linkEndpoints.get(e.linkId)?.busId
+      if (!busId) continue
+      for (const [edgeId, endpoints] of linkEndpoints) {
+        if (endpoints.busId === busId) linkActivity[edgeId] = e.ts
+      }
+    }
     frames.value = [...frames.value, ...events].slice(-MAX_FRAMES)
   }
 
@@ -119,6 +145,11 @@ export const useTopologyStore = defineStore('topology', () => {
     refresh(id)
   }
 
+  function createBus(id: string) {
+    busHandles.set(id, new WasmBus())
+    refreshBus(id)
+  }
+
   function destroyNode(id: string) {
     for (const [edgeId, endpoints] of linkEndpoints) {
       if (endpoints.sourceId === id || endpoints.targetId === id) disconnect(edgeId)
@@ -131,17 +162,53 @@ export const useTopologyStore = defineStore('topology', () => {
     delete publishing[id]
   }
 
-  /** Can `source` accept a new link to `target`? Used for canvas validation. */
-  function canConnect(sourceId: string, targetId: string): boolean {
+  function destroyBus(id: string) {
+    for (const [edgeId, endpoints] of linkEndpoints) {
+      if (endpoints.sourceId === id || endpoints.targetId === id) disconnect(edgeId)
+    }
+    busHandles.get(id)?.free()
+    busHandles.delete(id)
+    delete busStatuses[id]
+  }
+
+  function isBus(id: string): boolean {
+    return busHandles.has(id)
+  }
+
+  function connectionError(sourceId: string, targetId: string): string | undefined {
     const source = nodeHandles.get(sourceId)
     const target = nodeHandles.get(targetId)
-    return (
-      source !== undefined &&
-      target !== undefined &&
-      source.profile !== NodeProfile.Edge &&
-      target.profile !== NodeProfile.Router &&
-      target.uplinkFree
-    )
+    const sourceBus = busHandles.get(sourceId)
+    const targetBus = busHandles.get(targetId)
+
+    if (source && target) {
+      if (source.profile === NodeProfile.Edge) return 'Links must start at a Router or Bridge.'
+      if (target.profile === NodeProfile.Router) return 'Routers do not have an uplink.'
+      if (!target.uplinkFree) return 'The target node already has an uplink.'
+      return undefined
+    }
+    if (source && targetBus) {
+      if (source.profile !== NodeProfile.Router) {
+        return 'A shared bus must be controlled by a root Router.'
+      }
+      if (!targetBus.routerFree) return 'That bus already has a Router.'
+      return undefined
+    }
+    if (sourceBus && target) {
+      if (!sourceBus.routerAttached) return 'Connect a root Router to the bus first.'
+      if (target.profile !== NodeProfile.Edge) return 'Only Edge nodes can join a shared bus.'
+      if (target.linkKind !== LinkKind.Packet) {
+        return 'Select Packet transport on the Edge before joining a shared bus.'
+      }
+      if (!target.uplinkFree) return 'The target node already has an uplink.'
+      return undefined
+    }
+    return 'Connect Router → Bus → Packet Edge, or Router/Bridge → Node.'
+  }
+
+  /** Can `source` accept a new link to `target`? Used for canvas validation. */
+  function canConnect(sourceId: string, targetId: string): boolean {
+    return connectionError(sourceId, targetId) === undefined
   }
 
   /** Wire two canvas nodes together. Throws if the link is invalid.
@@ -149,13 +216,29 @@ export const useTopologyStore = defineStore('topology', () => {
   function connect(edgeId: string, sourceId: string, targetId: string): LinkKindType {
     const source = nodeHandles.get(sourceId)
     const target = nodeHandles.get(targetId)
-    if (!source || !target) throw new Error('unknown node')
-    const link = source.connectTo(target, edgeId)
+    const sourceBus = busHandles.get(sourceId)
+    const targetBus = busHandles.get(targetId)
+    const validationError = connectionError(sourceId, targetId)
+    if (validationError) throw new Error(validationError)
+
+    let link: WasmLink
+    let busId: string | undefined
+    if (sourceBus && target) {
+      link = sourceBus.attachEdge(target, edgeId)
+      busId = sourceId
+    } else if (source && targetBus) {
+      link = targetBus.attachRouter(source, edgeId)
+      busId = targetId
+    } else if (source && target) {
+      link = source.connectTo(target, edgeId)
+    } else {
+      throw new Error('unknown topology endpoint')
+    }
     linkHandles.set(edgeId, link)
-    linkEndpoints.set(edgeId, { sourceId, targetId })
+    linkEndpoints.set(edgeId, { sourceId, targetId, busId })
     // Warm the link with one ping so the child learns its address. Pending
     // bridge downlinks (netId 0) warm themselves after seed assignment.
-    if (link.netId > 0) {
+    if (!busId && source && target && link.netId > 0) {
       void source
         .ping(link.netId, 2, 500)
         .catch(() => {})
@@ -166,22 +249,46 @@ export const useTopologyStore = defineStore('topology', () => {
     }
     refresh(sourceId)
     refresh(targetId)
+    if (busId) refreshBus(busId)
     return link.kind === LinkKind.Packet ? 'packet' : 'stream'
   }
 
-  function disconnect(edgeId: string) {
+  function disconnectOne(edgeId: string) {
+    const endpoints = linkEndpoints.get(edgeId)
     linkHandles.get(edgeId)?.free()
     linkHandles.delete(edgeId)
     linkEndpoints.delete(edgeId)
+    delete linkActivity[edgeId]
+    if (!endpoints) return
+    refresh(endpoints.sourceId)
+    refresh(endpoints.targetId)
+    if (endpoints.busId) refreshBus(endpoints.busId)
+  }
+
+  /** Disconnect one canvas edge. Removing a Router→Bus edge tears down the
+   * whole bus segment so no visually connected device keeps a stale handle. */
+  function disconnect(edgeId: string): string[] {
+    const endpoints = linkEndpoints.get(edgeId)
+    const ids =
+      endpoints?.busId && busHandles.has(endpoints.targetId)
+        ? [...linkEndpoints]
+            .filter(([, candidate]) => candidate.busId === endpoints.busId)
+            .map(([id]) => id)
+        : [edgeId]
+    for (const id of ids) disconnectOne(id)
+    return ids
   }
 
   /** Tear down every live WASM handle and clear all topology state. */
   function dispose() {
-    for (const edgeId of linkHandles.keys()) disconnect(edgeId)
+    for (const edgeId of linkHandles.keys()) disconnectOne(edgeId)
+    for (const bus of busHandles.values()) bus.free()
     for (const node of nodeHandles.values()) node.free()
+    busHandles.clear()
     nodeHandles.clear()
     for (const id of Object.keys(statuses)) delete statuses[id]
     for (const id of Object.keys(linkCounts)) delete linkCounts[id]
+    for (const id of Object.keys(busStatuses)) delete busStatuses[id]
     for (const id of Object.keys(sensorData)) delete sensorData[id]
     for (const id of Object.keys(publishing)) delete publishing[id]
     for (const id of Object.keys(linkActivity)) delete linkActivity[id]
@@ -243,6 +350,7 @@ export const useTopologyStore = defineStore('topology', () => {
   return {
     ready,
     statuses,
+    busStatuses,
     linkCounts,
     frames,
     linkActivity,
@@ -255,7 +363,11 @@ export const useTopologyStore = defineStore('topology', () => {
     setImpairment,
     getImpairment,
     createNode,
+    createBus,
     destroyNode,
+    destroyBus,
+    isBus,
+    connectionError,
     canConnect,
     connect,
     disconnect,

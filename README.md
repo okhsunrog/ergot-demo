@@ -4,8 +4,8 @@
 
 A browser playground for [ergot](https://github.com/jamesmunns/ergot) networks.
 Draw a topology on a canvas and it runs for real: every node on the canvas is a
-full ergot NetStack compiled to WebAssembly, links carry real ergot frames
-(stream/COBS or packet flavor, per link), and pings route through actual
+full ergot NetStack compiled to WebAssembly, links and shared buses carry real
+ergot frames (stream/COBS or packet flavor), and pings route through actual
 Router / DirectEdge profiles. A frame inspector shows every frame on the wire,
 links animate with traffic, and per-link latency/loss knobs let you watch the
 UDP-like semantics degrade honestly.
@@ -25,6 +25,11 @@ Built with Vue 3.5, Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 - **Real routing**: each downlink gets its own network id from the Router
   profile; multi-hop edge → router → edge traffic works, addresses appear
   on node cards as edges learn them.
+- **Shared bus segments**: connect one root Router and multiple packet Edge
+  devices to a Bus. They share one network id while ergot's address-claim
+  protocol assigns and refreshes a unique node id for each device. Frames are
+  broadcast on the simulated medium, so device-to-device traffic is real bus
+  traffic rather than several point-to-point links drawn as a fan-out.
 - **Bridge routers**: router ↔ bridge ↔ edge hierarchies with live
   seed-router net assignment — a bridge's downlinks stay pending until its
   uplink activates, then lease globally routed network ids from upstream
@@ -36,7 +41,8 @@ Built with Vue 3.5, Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
   every node subscribes and charts received readings in a sparkline.
 - **Frame inspector**: every frame on the wire is tapped at the sink (src →
   dst, kind, seq) and listed live; links animate while traffic flows.
-- **Link impairment**: per-link latency and loss knobs. Packet links drop
+- **Link impairment**: latency and loss knobs per point-to-point link or shared
+  bus. Packet links drop
   whole frames; stream links corrupt the COBS stream mid-frame and resync —
   the honest failure mode of each transport.
 - **Runtime tests**: the WASM node API is tested in plain Node via `vp test`,
@@ -64,9 +70,9 @@ Built with Vue 3.5, Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 - Rust with the `wasm32-unknown-unknown` target and `wasm-pack`
   (`cargo install wasm-pack`)
 
-The ergot dependency currently tracks the
-[`okhsunrog:seed-delegation`](https://github.com/okhsunrog/ergot/tree/seed-delegation)
-branch — no local checkout is needed. To hack on ergot itself, use the
+The ergot dependency tracks
+[`jamesmunns/ergot:main`](https://github.com/jamesmunns/ergot/tree/main), so no
+local checkout is needed. To hack on ergot itself, use the
 `[patch]` override documented in `wasm/Cargo.toml` (and set `cache: false` on
 the `wasm:build` task in `vite.config.ts` so rebuilds pick up your local
 changes).

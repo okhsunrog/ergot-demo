@@ -24,7 +24,7 @@ pub(super) struct Impairment {
 
 impl Impairment {
     /// Apply the configured delay, then decide whether to drop this unit.
-    async fn delay_and_drop(&self, closer: &WaitQueue) -> Option<bool> {
+    pub(super) async fn delay_and_drop(&self, closer: &WaitQueue) -> Option<bool> {
         let latency = self.latency_ms.get();
         if latency > 0
             && matches!(

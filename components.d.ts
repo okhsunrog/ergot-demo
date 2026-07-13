@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    BusNode: typeof import('./src/components/BusNode.vue')['default']
     ErgotNode: typeof import('./src/components/ErgotNode.vue')['default']
     FrameInspector: typeof import('./src/components/FrameInspector.vue')['default']
     HelpModal: typeof import('./src/components/HelpModal.vue')['default']

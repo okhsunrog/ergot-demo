@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import type { Connection } from '@vue-flow/core'
 import ErgotNode, { nodeName, type ErgotNodeData } from './components/ErgotNode.vue'
+import BusNode, { busName, type BusNodeData } from './components/BusNode.vue'
 import FrameInspector from './components/FrameInspector.vue'
 import HelpModal from './components/HelpModal.vue'
 import { useTopologyStore, type LinkKindType, type ProfileType } from '@/stores/topology'
@@ -26,6 +27,7 @@ const {
 } = useVueFlow({ nodes: [], edges: [] })
 
 let nodeSeq = 0
+let busSeq = 0
 const newNodeId = () => `n-${crypto.randomUUID()}`
 const newEdgeId = () => `e-${crypto.randomUUID()}`
 
@@ -57,6 +59,22 @@ function addEdge() {
   addNode('edge')
 }
 
+function addBus(position?: { x: number; y: number }) {
+  const id = newNodeId()
+  store.createBus(id)
+  addNodes({
+    id,
+    type: 'bus',
+    position: position ?? project({ x: 250 + Math.random() * 100, y: 150 + Math.random() * 100 }),
+    data: { seq: ++busSeq },
+  })
+  return id
+}
+
+function addSharedBus() {
+  addBus()
+}
+
 function connectNodes(source: string, target: string): boolean {
   if (!store.canConnect(source, target)) return false
   const edgeId = newEdgeId()
@@ -73,7 +91,7 @@ function connectNodes(source: string, target: string): boolean {
     sourceHandle: 'bottom',
     target,
     targetHandle: 'top',
-    label: kind === 'packet' ? 'pkt' : 'cobs',
+    label: store.isBus(source) || store.isBus(target) ? 'bus' : kind === 'packet' ? 'pkt' : 'cobs',
     style: kind === 'packet' ? { strokeDasharray: '6 3' } : undefined,
   })
   return true
@@ -100,11 +118,11 @@ function onConnect(connection: Connection) {
     })
     return
   }
-  if (!store.canConnect(connection.source, connection.target)) {
+  const validationError = store.connectionError(connection.source, connection.target)
+  if (validationError) {
     toast.add({
       title: 'Invalid connection',
-      description:
-        'Links go from a router/bridge down to a bridge or edge node with a free uplink.',
+      description: validationError,
       color: 'warning',
     })
     return
@@ -122,14 +140,16 @@ function deleteSelected() {
     (e) =>
       selectedEdges.some((s) => s.id === e.id) || nodeIds.has(e.source) || nodeIds.has(e.target),
   )
+  const droppedEdgeIds = new Set<string>()
   for (const edge of edgesToDrop) {
-    store.disconnect(edge.id)
-    store.refresh(edge.source)
-    store.refresh(edge.target)
+    for (const droppedId of store.disconnect(edge.id)) droppedEdgeIds.add(droppedId)
   }
-  if (edgesToDrop.length) removeEdges(edgesToDrop.map((e) => e.id))
+  if (droppedEdgeIds.size) removeEdges([...droppedEdgeIds])
 
-  for (const id of nodeIds) store.destroyNode(id)
+  for (const id of nodeIds) {
+    if (store.isBus(id)) store.destroyBus(id)
+    else store.destroyNode(id)
+  }
   if (selectedNodes.length) removeNodes(selectedNodes)
 }
 
@@ -159,9 +179,15 @@ function toggleInspector() {
 function resolveLink(edgeId: string): string {
   const edge = edges.value.find((e) => e.id === edgeId)
   if (!edge) return edgeId.slice(0, 8)
-  const srcData = findNode(edge.source)?.data as ErgotNodeData | undefined
-  const tgtData = findNode(edge.target)?.data as ErgotNodeData | undefined
-  return `${srcData ? nodeName(srcData) : edge.source} ⇄ ${tgtData ? nodeName(tgtData) : edge.target}`
+  return `${canvasNodeName(edge.source)} ⇄ ${canvasNodeName(edge.target)}`
+}
+
+function canvasNodeName(id: string): string {
+  const node = findNode(id)
+  if (!node) return id
+  return node.type === 'bus'
+    ? busName(node.data as BusNodeData)
+    : nodeName(node.data as ErgotNodeData)
 }
 
 function animateActiveEdges() {
@@ -198,7 +224,7 @@ function applyImpairment() {
 
 // Ping between the two selected nodes
 const selectedPair = computed(() => {
-  const sel = getSelectedNodes.value
+  const sel = getSelectedNodes.value.filter((node) => node.type === 'ergot')
   return sel.length === 2 ? sel : null
 })
 
@@ -233,12 +259,17 @@ onMounted(async () => {
   if (!localStorage.getItem(HELP_SEEN_KEY)) openHelp()
   await store.initWasm()
 
-  // Seed a small default topology: one router with two edge nodes.
-  const router = addNode('router', { x: 250, y: 50 })
-  const nodeB = addNode('edge', { x: 100, y: 250 })
-  const nodeC = addNode('edge', { x: 400, y: 250 }, 'packet')
-  connectNodes(router, nodeB)
-  connectNodes(router, nodeC)
+  // Show both transport shapes immediately: two packet devices share one
+  // claimed-address bus while a stream node keeps a point-to-point link.
+  const router = addNode('router', { x: 300, y: 40 })
+  const bus = addBus({ x: 150, y: 200 })
+  const busA = addNode('edge', { x: 40, y: 350 }, 'packet')
+  const busB = addNode('edge', { x: 260, y: 350 }, 'packet')
+  const point = addNode('edge', { x: 500, y: 220 })
+  connectNodes(router, bus)
+  connectNodes(bus, busA)
+  connectNodes(bus, busB)
+  connectNodes(router, point)
   void fitView()
 
   refreshTimer = setInterval(() => store.refreshAll(), 1000)
@@ -269,6 +300,9 @@ onUnmounted(() => {
           >
           <UButton icon="i-lucide-git-fork" :disabled="!store.ready" @click="addBridge"
             >Add Bridge</UButton
+          >
+          <UButton icon="i-lucide-network" :disabled="!store.ready" @click="addSharedBus"
+            >Add Bus</UButton
           >
           <UButton icon="i-lucide-plus" :disabled="!store.ready" @click="addEdge">Add Node</UButton>
           <UButton color="error" variant="outline" icon="i-lucide-trash-2" @click="deleteSelected"
@@ -325,6 +359,9 @@ onUnmounted(() => {
           <template #node-ergot="nodeProps">
             <ErgotNode :id="nodeProps.id" :data="nodeProps.data" />
           </template>
+          <template #node-bus="nodeProps">
+            <BusNode :id="nodeProps.id" :data="nodeProps.data" />
+          </template>
         </VueFlow>
       </div>
       <FrameInspector v-if="showInspector" :frames="store.frames" :resolve-link="resolveLink" />
@@ -350,9 +387,24 @@ onUnmounted(() => {
   box-shadow: var(--tw-shadow, 0 1px 2px rgb(0 0 0 / 0.05));
 }
 
+.vue-flow__node-bus {
+  background: color-mix(in srgb, var(--ui-secondary) 10%, var(--ui-bg-accented));
+  color: var(--ui-text-highlighted);
+  border: 1px solid color-mix(in srgb, var(--ui-secondary) 55%, var(--ui-border-default));
+  border-radius: var(--ui-radius);
+  padding: 0;
+  font-size: 0.75rem;
+  box-shadow: var(--tw-shadow, 0 1px 2px rgb(0 0 0 / 0.05));
+}
+
 .vue-flow__node-ergot.selected {
   border-color: var(--ui-primary);
   box-shadow: 0 0 0 2px var(--ui-primary);
+}
+
+.vue-flow__node-bus.selected {
+  border-color: var(--ui-secondary);
+  box-shadow: 0 0 0 2px var(--ui-secondary);
 }
 
 .vue-flow__edge-path {
