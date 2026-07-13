@@ -301,7 +301,11 @@ impl WasmNode {
             let closer = services_closer.clone();
             spawn_local(async move {
                 let _ = select(
-                    stack.services().seed_router_request_handler::<4>(),
+                    stack
+                        .services()
+                        .seed_router_request_handler_with_timeout::<4, _, _>(|| {
+                            gloo_timers::future::TimeoutFuture::new(1_000)
+                        }),
                     closer.wait(),
                 )
                 .await;
