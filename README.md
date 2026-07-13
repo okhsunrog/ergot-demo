@@ -64,11 +64,12 @@ Built with Vue 3.5, Nuxt UI v4, Pinia, Vue Flow, and a Rust/WASM module
 - Rust with the `wasm32-unknown-unknown` target and `wasm-pack`
   (`cargo install wasm-pack`)
 
-The ergot dependency is fetched straight from
-[ergot main](https://github.com/jamesmunns/ergot) — no local checkout is
-needed. To hack on ergot itself, use the `[patch]` override documented in
-`wasm/Cargo.toml` (and set `cache: false` on the `wasm:build` task in
-`vite.config.ts` so rebuilds pick up your local changes).
+The ergot dependency currently tracks the
+[`okhsunrog:seed-delegation`](https://github.com/okhsunrog/ergot/tree/seed-delegation)
+branch — no local checkout is needed. To hack on ergot itself, use the
+`[patch]` override documented in `wasm/Cargo.toml` (and set `cache: false` on
+the `wasm:build` task in `vite.config.ts` so rebuilds pick up your local
+changes).
 
 ## Develop
 

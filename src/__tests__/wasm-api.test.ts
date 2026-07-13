@@ -513,6 +513,94 @@ test('bridge: seed lease arrives and traffic routes root → bridge → edge', a
   for (const n of [root, bridge, edge]) n.free()
 })
 
+test('bridge: seed delegation routes across mixed transports', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const transit = new WasmNode(NodeProfile.Bridge, LinkKind.Packet)
+  const leaf = new WasmNode(NodeProfile.Bridge, LinkKind.Stream)
+  const edge = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const linkRT = root.connectTo(transit)
+  const linkTL = transit.connectTo(leaf)
+  const linkLE = leaf.connectTo(edge)
+  expect(linkRT.kind).toBe(LinkKind.Packet)
+  expect(linkTL.kind).toBe(LinkKind.Stream)
+  expect(linkLE.kind).toBe(LinkKind.Packet)
+  expect(linkTL.netId).toBe(0)
+  expect(linkLE.netId).toBe(0)
+  await edge.servePing()
+
+  // Activate the first uplink. The transit bridge must obtain a lease for
+  // the leaf bridge, which can then delegate another lease to the edge.
+  await root.ping(linkRT.netId, 2, 300).catch(() => {})
+  await waitFor(() => bridgeStatus(transit).nets.length === 1)
+  await waitFor(() => bridgeStatus(leaf).nets.length === 1)
+  await waitFor(() => (edgeStatus(edge).netId ?? 0) > 0)
+
+  const transitNet = bridgeStatus(transit).nets[0]!
+  const leafNet = bridgeStatus(leaf).nets[0]!
+  expect(transitNet).not.toBe(linkRT.netId)
+  expect(leafNet).not.toBe(transitNet)
+
+  const res = await root.ping(leafNet, 2)
+  expect(res.value).toBe(42)
+
+  linkLE.free()
+  linkTL.free()
+  linkRT.free()
+  for (const n of [root, transit, leaf, edge]) n.free()
+})
+
+test('bridge: nested orphan subtree delegates after its root appears', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const transit = new WasmNode(NodeProfile.Bridge)
+  const leaf = new WasmNode(NodeProfile.Bridge, LinkKind.Packet)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const linkTL = transit.connectTo(leaf)
+  const linkLE = leaf.connectTo(edge)
+  await edge.servePing()
+
+  await sleep(200)
+  expect(bridgeStatus(transit).nets).toEqual([])
+  expect(bridgeStatus(leaf).nets).toEqual([])
+
+  const linkRT = root.connectTo(transit)
+  await root.ping(linkRT.netId, 2, 300).catch(() => {})
+  await waitFor(() => bridgeStatus(transit).nets.length === 1)
+  await waitFor(() => bridgeStatus(leaf).nets.length === 1)
+  await waitFor(() => (edgeStatus(edge).netId ?? 0) > 0)
+
+  const edgeNet = edgeStatus(edge).netId!
+  expect((await root.ping(edgeNet, 2)).value).toBe(42)
+
+  linkLE.free()
+  linkTL.free()
+  linkRT.free()
+  for (const n of [root, transit, leaf, edge]) n.free()
+})
+
+test('bridge: seed assignment recovers after total uplink loss', async () => {
+  const root = new WasmNode(NodeProfile.Router)
+  const bridge = new WasmNode(NodeProfile.Bridge, LinkKind.Packet)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const linkRB = root.connectTo(bridge)
+  const linkBE = bridge.connectTo(edge)
+  await edge.servePing()
+
+  linkRB.setImpairment(0, 100)
+  await root.ping(linkRB.netId, 2, 200).catch(() => {})
+  await sleep(200)
+  expect(bridgeStatus(bridge).nets).toEqual([])
+
+  linkRB.setImpairment(0, 0)
+  await root.ping(linkRB.netId, 2, 300).catch(() => {})
+  await waitFor(() => bridgeStatus(bridge).nets.length === 1)
+  await waitFor(() => (edgeStatus(edge).netId ?? 0) > 0)
+  expect((await root.ping(edgeStatus(edge).netId!, 2)).value).toBe(42)
+
+  linkBE.free()
+  linkRB.free()
+  for (const n of [root, bridge, edge]) n.free()
+})
+
 test('bridge: orphan subtree gets its lease once the uplink appears', async () => {
   const root = new WasmNode(NodeProfile.Router)
   const bridge = new WasmNode(NodeProfile.Bridge)
