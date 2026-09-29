@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
 use futures_channel::mpsc::channel;
-use gloo_timers::future::TimeoutFuture;
 use maitake_sync::WaitQueue;
 use serde::Serialize;
 use tsify_next::Tsify;
@@ -45,6 +44,7 @@ use ergot::{
         utils::std::{StdQueue, new_std_queue},
     },
     net_stack::ArcNetStack,
+    time::{Duration, Instant, TimedOut, sleep, with_timeout},
     well_known::ErgotPingEndpoint,
 };
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
@@ -76,6 +76,14 @@ const MAX_SEEDS: usize = 16;
 const MAX_CLAIMS: usize = 64;
 const PACKET_QUEUE_FRAMES: usize = 16;
 const MAX_LATENCY_MS: u32 = 60_000;
+
+/// Wait `duration`; true means `closer` fired first and the task should end.
+async fn closed_within(closer: &WaitQueue, duration: Duration) -> bool {
+    matches!(
+        select(sleep(duration), closer.wait()).await,
+        Either::Second(_)
+    )
+}
 
 fn fmt_addr(a: &Address) -> String {
     format!("{}.{}:{}", a.network_id, a.node_id, a.port_id)
@@ -314,11 +322,7 @@ impl WasmNode {
             let closer = services_closer.clone();
             spawn_local(async move {
                 let _ = select(
-                    stack
-                        .services()
-                        .seed_router_request_handler_with_timeout::<4, _, _>(|| {
-                            gloo_timers::future::TimeoutFuture::new(1_000)
-                        }),
+                    stack.services().seed_router_request_handler::<4>(),
                     closer.wait(),
                 )
                 .await;
@@ -695,7 +699,7 @@ impl WasmNode {
             port_id: 0,
         };
         let timeout = timeout_ms.unwrap_or(1_000);
-        let start = js_sys::Date::now();
+        let start = Instant::now();
         let req = async {
             match &self.stack {
                 Stack::Router(stack) | Stack::Bridge { stack, .. } => {
@@ -712,13 +716,13 @@ impl WasmNode {
                 }
             }
         };
-        match select(req, TimeoutFuture::new(timeout)).await {
-            Either::First(Ok(value)) => Ok(PingResult {
+        match with_timeout(Duration::from_millis(timeout.into()), req).await {
+            Ok(Ok(value)) => Ok(PingResult {
                 value,
-                latency_ms: js_sys::Date::now() - start,
+                latency_ms: start.elapsed().as_millis() as f64,
             }),
-            Either::First(Err(e)) => Err(JsError::new(&format!("ping failed: {e:?}"))),
-            Either::Second(()) => Err(JsError::new(&format!("ping timed out after {timeout} ms"))),
+            Ok(Err(e)) => Err(JsError::new(&format!("ping failed: {e:?}"))),
+            Err(TimedOut) => Err(JsError::new(&format!("ping timed out after {timeout} ms"))),
         }
     }
 
@@ -812,7 +816,7 @@ impl WasmNode {
         self.stop_publisher();
         let closer = Arc::new(WaitQueue::new());
         *self.publisher_closer.borrow_mut() = Some(closer.clone());
-        let interval = interval_ms.max(20);
+        let interval = Duration::from_millis(interval_ms.max(20).into());
 
         macro_rules! run_publisher {
             ($stack:expr) => {{
@@ -820,8 +824,8 @@ impl WasmNode {
                 spawn_local(async move {
                     let publish_loop = async {
                         loop {
-                            TimeoutFuture::new(interval).await;
-                            let t = js_sys::Date::now() / 1000.0;
+                            sleep(interval).await;
+                            let t = Instant::now().as_millis() as f64 / 1000.0;
                             let value = ((t * core::f64::consts::TAU * 0.3).sin()
                                 + js_sys::Math::random() * 0.1)
                                 as f32;

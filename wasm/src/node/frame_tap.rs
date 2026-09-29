@@ -3,9 +3,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ergot::{
-    Address, HeaderSeq, ProtocolError,
+    Address, FrameKind, Header, ProtocolError, TrafficClass,
     interface_manager::{
-        Interface, InterfaceSink,
+        Interface, InterfaceSink, LinkMeta,
         utils::{cobs_stream, framed_stream, std::StdQueue},
     },
 };
@@ -26,9 +26,10 @@ pub struct FrameEvent {
     pub dir: String,
     pub src: String,
     pub dst: String,
-    /// "req" | "resp" | "topic" | "err" | numeric kind.
+    /// "req" | "resp" | "topic" | "err".
     pub kind: String,
-    pub seq: u16,
+    /// Traffic class: "control" | "normal" | "bulk" | "background".
+    pub class: String,
     /// `Date.now()` timestamp.
     pub ts: f64,
 }
@@ -67,13 +68,22 @@ fn fmt_addr(a: &Address) -> String {
     format!("{}.{}:{}", a.network_id, a.node_id, a.port_id)
 }
 
-fn kind_name(kind: u8) -> String {
+fn kind_name(kind: FrameKind) -> String {
     match kind {
-        1 => "req".into(),
-        2 => "resp".into(),
-        3 => "topic".into(),
-        255 => "err".into(),
-        other => other.to_string(),
+        FrameKind::ENDPOINT_REQ => "req".into(),
+        FrameKind::ENDPOINT_RESP => "resp".into(),
+        FrameKind::TOPIC_MSG => "topic".into(),
+        FrameKind::PROTOCOL_ERROR => "err".into(),
+        FrameKind(other) => other.to_string(),
+    }
+}
+
+fn class_name(class: TrafficClass) -> &'static str {
+    match class {
+        TrafficClass::Control => "control",
+        TrafficClass::Normal => "normal",
+        TrafficClass::Bulk => "bulk",
+        TrafficClass::Background => "background",
     }
 }
 
@@ -94,7 +104,7 @@ pub(super) struct Tap {
 }
 
 impl Tap {
-    fn record(&self, hdr: &HeaderSeq) {
+    fn record(&self, hdr: &Header) {
         let Some(binding) = self.label.borrow().clone() else {
             return;
         };
@@ -103,8 +113,8 @@ impl Tap {
             dir: self.dir.into(),
             src: fmt_addr(&hdr.src),
             dst: fmt_addr(&hdr.dst),
-            kind: kind_name(hdr.kind.0),
-            seq: hdr.seq_no,
+            kind: kind_name(hdr.kind),
+            class: class_name(hdr.class).into(),
             ts: js_sys::Date::now(),
         };
         FRAME_EVENTS.with(|q| {
@@ -135,10 +145,15 @@ impl InterfaceSink for WasmSink {
         }
     }
 
-    fn send_ty<T: SerdeSerialize>(&mut self, hdr: &HeaderSeq, body: &T) -> Result<(), ()> {
+    fn send_ty<T: SerdeSerialize>(
+        &mut self,
+        link: &LinkMeta,
+        hdr: &Header,
+        body: &T,
+    ) -> Result<(), ()> {
         let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_ty(hdr, body),
-            SinkInner::Packet(s) => s.send_ty(hdr, body),
+            SinkInner::Stream(s) => s.send_ty(link, hdr, body),
+            SinkInner::Packet(s) => s.send_ty(link, hdr, body),
         };
         if result.is_ok() {
             self.tap.record(hdr);
@@ -146,10 +161,10 @@ impl InterfaceSink for WasmSink {
         result
     }
 
-    fn send_raw(&mut self, hdr: &HeaderSeq, body: &[u8]) -> Result<(), ()> {
+    fn send_raw(&mut self, link: &LinkMeta, hdr: &Header, body: &[u8]) -> Result<(), ()> {
         let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_raw(hdr, body),
-            SinkInner::Packet(s) => s.send_raw(hdr, body),
+            SinkInner::Stream(s) => s.send_raw(link, hdr, body),
+            SinkInner::Packet(s) => s.send_raw(link, hdr, body),
         };
         if result.is_ok() {
             self.tap.record(hdr);
@@ -157,10 +172,10 @@ impl InterfaceSink for WasmSink {
         result
     }
 
-    fn send_err(&mut self, hdr: &HeaderSeq, err: ProtocolError) -> Result<(), ()> {
+    fn send_err(&mut self, link: &LinkMeta, hdr: &Header, err: ProtocolError) -> Result<(), ()> {
         let result = match &mut self.inner {
-            SinkInner::Stream(s) => s.send_err(hdr, err),
-            SinkInner::Packet(s) => s.send_err(hdr, err),
+            SinkInner::Stream(s) => s.send_err(link, hdr, err),
+            SinkInner::Packet(s) => s.send_err(link, hdr, err),
         };
         if result.is_ok() {
             self.tap.record(hdr);

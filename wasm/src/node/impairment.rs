@@ -4,15 +4,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
+use ergot::time::Duration;
 use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use futures_core::Stream;
-use gloo_timers::future::TimeoutFuture;
 use maitake_sync::WaitQueue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::duplex;
 
-use super::BUF_SIZE;
+use super::{BUF_SIZE, closed_within};
 
 /// Shared, live-tunable impairment parameters for one link.
 #[derive(Clone, Default)]
@@ -26,12 +26,7 @@ impl Impairment {
     /// Apply the configured delay, then decide whether to drop this unit.
     pub(super) async fn delay_and_drop(&self, closer: &WaitQueue) -> Option<bool> {
         let latency = self.latency_ms.get();
-        if latency > 0
-            && matches!(
-                select(TimeoutFuture::new(latency), closer.wait()).await,
-                Either::Second(_)
-            )
-        {
+        if latency > 0 && closed_within(closer, Duration::from_millis(latency.into())).await {
             return None;
         }
         let loss = self.loss_pct.get();

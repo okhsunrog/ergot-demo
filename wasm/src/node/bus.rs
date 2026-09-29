@@ -12,8 +12,8 @@ use embassy_futures::select::{Either, select};
 use ergot::interface_manager::transports::packet::PacketSender;
 use ergot::interface_manager::{InterfaceState, Profile};
 use ergot::net_stack::services::{bus_claim_refresh, bus_claim_with_retry};
+use ergot::time::{Duration, TimedOut, with_timeout};
 use futures_channel::mpsc::{Sender as MpscSender, channel};
-use gloo_timers::future::TimeoutFuture;
 use maitake_sync::WaitQueue;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -21,7 +21,12 @@ use wasm_bindgen_futures::spawn_local;
 use super::frame_tap::{Tap, TapBinding, TapLabel, new_sink, next_link_generation};
 use super::impairment::Impairment;
 use super::transport::{LinkClosed, StackSide, spawn_packet_worker};
-use super::{LinkKind, LinkState, PACKET_QUEUE_FRAMES, QUEUE_SIZE, Stack, WasmLink, WasmNode};
+use super::{
+    LinkKind, LinkState, PACKET_QUEUE_FRAMES, QUEUE_SIZE, Stack, WasmLink, WasmNode, closed_within,
+};
+
+/// How long one claim or refresh round may take before it is retried.
+const CLAIM_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 struct BusMember {
     id: u64,
@@ -351,63 +356,60 @@ impl Drop for WasmBus {
 }
 
 fn spawn_bus_claim(stack: super::EdgeStack, candidate: u8, nonce: u64, closer: Arc<WaitQueue>) {
-    async fn closed_within(closer: &WaitQueue, ms: u32) -> bool {
-        matches!(
-            select(TimeoutFuture::new(ms), closer.wait()).await,
-            Either::Second(_)
-        )
-    }
-
     spawn_local(async move {
         'claim: loop {
             let candidates = (candidate..=254).chain(3..candidate);
-            let claim = bus_claim_with_retry(&stack, (), candidates, nonce);
-            let lease = match select(claim, select(TimeoutFuture::new(1_500), closer.wait())).await
-            {
-                Either::First(Ok(lease)) => lease,
-                Either::First(Err(err)) => {
+            let claim = with_timeout(
+                CLAIM_TIMEOUT,
+                bus_claim_with_retry(&stack, (), candidates, nonce),
+            );
+            let lease = match select(claim, closer.wait()).await {
+                Either::First(Ok(Ok(lease))) => lease,
+                Either::First(Ok(Err(err))) => {
                     log::warn!("bus address claim failed: {err:?}");
-                    if closed_within(&closer, 250).await {
+                    if closed_within(&closer, Duration::from_millis(250)).await {
                         return;
                     }
                     continue;
                 }
-                Either::Second(Either::First(())) => {
+                Either::First(Err(TimedOut)) => {
                     log::warn!("bus address claim timed out; retrying");
                     continue;
                 }
-                Either::Second(Either::Second(_)) => return,
+                Either::Second(_) => return,
             };
 
             let mut lease = lease;
             let mut failures = 0u8;
             loop {
-                let delay_s = if failures == 0 {
-                    u32::from(
-                        lease
-                            .expires_seconds
-                            .saturating_sub(lease.min_refresh_seconds),
+                let delay = if failures == 0 {
+                    Duration::from_secs(
+                        u64::from(
+                            lease
+                                .expires_seconds
+                                .saturating_sub(lease.min_refresh_seconds),
+                        )
+                        .max(1),
                     )
-                    .max(1)
                 } else {
-                    2
+                    Duration::from_secs(2)
                 };
-                if closed_within(&closer, delay_s * 1_000).await {
+                if closed_within(&closer, delay).await {
                     return;
                 }
 
-                let refresh = bus_claim_refresh(&stack, &lease);
-                match select(refresh, select(TimeoutFuture::new(1_500), closer.wait())).await {
-                    Either::First(Ok(refreshed)) => {
+                let refresh = with_timeout(CLAIM_TIMEOUT, bus_claim_refresh(&stack, &lease));
+                match select(refresh, closer.wait()).await {
+                    Either::First(Ok(Ok(refreshed))) => {
                         lease = refreshed;
                         failures = 0;
                     }
-                    Either::Second(Either::Second(_)) => return,
-                    Either::First(Err(err)) => {
+                    Either::Second(_) => return,
+                    Either::First(Ok(Err(err))) => {
                         failures += 1;
                         log::warn!("bus address refresh failed ({failures}x): {err:?}");
                     }
-                    Either::Second(Either::First(())) => {
+                    Either::First(Err(TimedOut)) => {
                         failures += 1;
                         log::warn!("bus address refresh timed out ({failures}x)");
                     }

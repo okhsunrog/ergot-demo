@@ -33,7 +33,7 @@ function fmtTime(ts: number): string {
           <th class="px-3 py-1 font-normal">dir</th>
           <th class="px-3 py-1 font-normal">src → dst</th>
           <th class="px-3 py-1 font-normal">kind</th>
-          <th class="px-3 py-1 font-normal">seq</th>
+          <th class="px-3 py-1 font-normal">class</th>
         </tr>
       </thead>
       <tbody>
@@ -42,7 +42,7 @@ function fmtTime(ts: number): string {
         </tr>
         <tr
           v-for="(f, i) in rows"
-          :key="`${f.ts}-${f.seq}-${i}`"
+          :key="`${f.ts}-${f.linkId}-${i}`"
           class="border-t border-(--ui-border-muted)/40 text-(--ui-text-default)"
         >
           <td class="px-3 py-0.5 text-(--ui-text-muted)">{{ fmtTime(f.ts) }}</td>
@@ -56,7 +56,7 @@ function fmtTime(ts: number): string {
           <td class="px-3 py-0.5">
             <span :style="{ color: kindColors[f.kind] }">{{ f.kind }}</span>
           </td>
-          <td class="px-3 py-0.5 text-(--ui-text-muted)">{{ f.seq }}</td>
+          <td class="px-3 py-0.5 text-(--ui-text-muted)">{{ f.class }}</td>
         </tr>
       </tbody>
     </table>

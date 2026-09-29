@@ -11,14 +11,12 @@ console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 embassy-futures = "0.1.2"
 ergot = { git = "https://github.com/jamesmunns/ergot", branch = "main", default-features = false, features = [
-  "std",
+  "wasm",
   "futures-io",
 ] }
 futures-channel = "0.3.32"
 futures-core = "0.3.32"
 futures-io = "0.3.32"
-getrandom = { version = "0.3", features = ["wasm_js"] }
-gloo-timers = { version = "0.4.0", features = ["futures"] }
 js-sys = "0.3.92"
 log = "0.4.29"
 maitake-sync = "0.3"
