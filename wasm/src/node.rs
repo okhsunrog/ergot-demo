@@ -21,7 +21,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::pin::pin;
+use std::future::Future;
+use std::pin::{Pin, pin};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
@@ -125,6 +126,45 @@ where
     });
 }
 
+// A node's status, computed on its locked profile, so `wait_profile` can
+// compare it on every state change.
+
+fn router_status(im: &mut RouterProfile) -> NodeStatus {
+    NodeStatus::Router {
+        nets: im.get_nets(),
+    }
+}
+
+fn bridge_status(im: &mut RouterProfile) -> NodeStatus {
+    let mut nets = im.get_nets();
+    let (upstream, upstream_net_id) = match im.interface_state(UPSTREAM_IDENT) {
+        Some(InterfaceState::Active { net_id, .. }) => ("active", Some(net_id)),
+        Some(InterfaceState::Inactive) => ("inactive", None),
+        _ => ("down", None),
+    };
+    if let Some(up) = upstream_net_id {
+        nets.retain(|n| *n != up);
+    }
+    NodeStatus::Bridge {
+        upstream: upstream.into(),
+        upstream_net_id,
+        nets,
+    }
+}
+
+fn edge_status(im: &mut EdgeProfile) -> NodeStatus {
+    let (status, net_id, node_id) = match im.interface_state(()) {
+        Some(InterfaceState::Active { net_id, node_id }) => ("active", Some(net_id), Some(node_id)),
+        Some(InterfaceState::Inactive) => ("inactive", None, None),
+        _ => ("down", None, None),
+    };
+    NodeStatus::Edge {
+        status: status.into(),
+        net_id,
+        node_id,
+    }
+}
+
 /// Answer the heartbeats of every child linked below this node.
 async fn serve_heartbeats(stack: RouterStack) {
     let server = stack
@@ -156,11 +196,11 @@ fn push_sample(
     });
 }
 
-type EdgeStack = ArcNetStack<CriticalSectionRawMutex, DirectEdge<WasmInterface>>;
-type RouterStack = ArcNetStack<
-    CriticalSectionRawMutex,
-    Router<WasmInterface, rand::rngs::StdRng, MAX_INTERFACES, MAX_SEEDS, MAX_CLAIMS>,
->;
+type EdgeProfile = DirectEdge<WasmInterface>;
+type RouterProfile =
+    Router<WasmInterface, rand::rngs::StdRng, MAX_INTERFACES, MAX_SEEDS, MAX_CLAIMS>;
+type EdgeStack = ArcNetStack<CriticalSectionRawMutex, EdgeProfile>;
+type RouterStack = ArcNetStack<CriticalSectionRawMutex, RouterProfile>;
 
 enum Stack {
     Router(RouterStack),
@@ -254,7 +294,7 @@ pub struct PingResult {
 }
 
 /// Current state of a node, for display on the canvas.
-#[derive(Serialize, Tsify)]
+#[derive(Serialize, Tsify, PartialEq)]
 #[tsify(into_wasm_abi)]
 #[serde(
     tag = "profile",
@@ -446,47 +486,44 @@ impl WasmNode {
     /// Current state of the node (router downlink nets / edge uplink state).
     pub fn status(&self) -> NodeStatus {
         match &self.stack {
-            Stack::Router(stack) => NodeStatus::Router {
-                nets: stack.manage_profile(|im| im.get_nets()),
-            },
-            Stack::Bridge { stack, .. } => {
-                let (state, mut nets) =
-                    stack.manage_profile(|im| (im.interface_state(UPSTREAM_IDENT), im.get_nets()));
-                let (upstream, upstream_net_id) = match state {
-                    Some(InterfaceState::Active { net_id, .. }) => ("active", Some(net_id)),
-                    Some(InterfaceState::Inactive) => ("inactive", None),
-                    _ => ("down", None),
-                };
-                if let Some(up) = upstream_net_id {
-                    nets.retain(|n| *n != up);
-                }
-                NodeStatus::Bridge {
-                    upstream: upstream.into(),
-                    upstream_net_id,
-                    nets,
-                }
-            }
-            Stack::Edge { stack, .. } => {
-                let state = stack.manage_profile(|im| im.interface_state(()));
-                match state {
-                    Some(InterfaceState::Active { net_id, node_id }) => NodeStatus::Edge {
-                        status: "active".into(),
-                        net_id: Some(net_id),
-                        node_id: Some(node_id),
-                    },
-                    Some(InterfaceState::Inactive) => NodeStatus::Edge {
-                        status: "inactive".into(),
-                        net_id: None,
-                        node_id: None,
-                    },
-                    _ => NodeStatus::Edge {
-                        status: "down".into(),
-                        net_id: None,
-                        node_id: None,
-                    },
-                }
-            }
+            Stack::Router(stack) => stack.manage_profile(router_status),
+            Stack::Bridge { stack, .. } => stack.manage_profile(bridge_status),
+            Stack::Edge { stack, .. } => stack.manage_profile(edge_status),
         }
+    }
+
+    /// Resolves with `true` once [`status`](Self::status) differs from what
+    /// it returns now, or with `false` once the node is freed. Call `status()`
+    /// and this in the same turn, then again after it resolves, to follow the
+    /// node without polling: nothing can change in between. It holds no
+    /// borrow of the node, so the node can be freed while it is pending.
+    #[wasm_bindgen(js_name = waitStatusChange, unchecked_return_type = "Promise<boolean>")]
+    pub fn wait_status_change(&self) -> js_sys::Promise {
+        /// Wait for `status` of the stack's profile to differ from now.
+        fn changed<P: Profile + 'static>(
+            stack: &ArcNetStack<CriticalSectionRawMutex, P>,
+            status: fn(&mut P) -> NodeStatus,
+        ) -> Pin<Box<dyn Future<Output = ()>>> {
+            let stack = stack.clone();
+            // Taken now, not when the future first runs.
+            let current = stack.manage_profile(status);
+            Box::pin(async move {
+                stack
+                    .wait_profile(|im| (status(im) != current).then_some(()))
+                    .await
+            })
+        }
+
+        let changed = match &self.stack {
+            Stack::Router(stack) => changed(stack, router_status),
+            Stack::Bridge { stack, .. } => changed(stack, bridge_status),
+            Stack::Edge { stack, .. } => changed(stack, edge_status),
+        };
+        let freed = self.services_closer.clone();
+        wasm_bindgen_futures::future_to_promise(async move {
+            let changed = matches!(select(changed, freed.wait()).await, Either::First(()));
+            Ok(JsValue::from_bool(changed))
+        })
     }
 
     /// Connect this node (router or bridge: downlink side) to a bridge or

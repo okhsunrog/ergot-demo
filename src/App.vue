@@ -252,7 +252,6 @@ async function pingSelected() {
   }
 }
 
-let refreshTimer: ReturnType<typeof setInterval> | undefined
 let frameTimer: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
@@ -272,7 +271,8 @@ onMounted(async () => {
   connectNodes(router, point)
   void fitView()
 
-  refreshTimer = setInterval(() => store.refreshAll(), 1000)
+  // Node statuses follow state changes on their own (see the store's
+  // `watch`); frames and sensor samples are streams, drained here.
   frameTimer = setInterval(() => {
     store.pollFrames()
     store.pollSamples()
@@ -281,7 +281,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  if (refreshTimer) clearInterval(refreshTimer)
   if (frameTimer) clearInterval(frameTimer)
   store.dispose()
 })

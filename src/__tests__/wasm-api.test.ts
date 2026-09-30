@@ -761,3 +761,25 @@ test('liveness: a quiet shared bus stays up', async () => {
   bus.free()
   for (const node of [router, a]) node.free()
 }, 10_000)
+
+test('waitStatusChange resolves on a state change, and with false once freed', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const edge = new WasmNode(NodeProfile.Edge)
+  const routerChanged = router.waitStatusChange()
+  const edgeChanged = edge.waitStatusChange()
+
+  const link = router.connectTo(edge)
+  expect(await routerChanged).toBe(true)
+  expect(await edgeChanged).toBe(true)
+  expect(edgeStatus(edge).status).toBe('active')
+
+  // Freeing a node with a wait pending must work, and ends the wait.
+  const lonely = new WasmNode(NodeProfile.Edge)
+  const gone = lonely.waitStatusChange()
+  lonely.free()
+  expect(await gone).toBe(false)
+
+  link.free()
+  edge.free()
+  router.free()
+})

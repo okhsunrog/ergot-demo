@@ -73,9 +73,18 @@ export const useTopologyStore = defineStore('topology', () => {
     linkCounts[id] = handle.linkCount
   }
 
-  function refreshAll() {
-    for (const id of nodeHandles.keys()) refresh(id)
-    for (const id of busHandles.keys()) refreshBus(id)
+  /**
+   * Keep a node's status, and what hangs off it, current without polling:
+   * refresh, then wait for its next state change in the same turn, so no
+   * change slips in between. Ends once the node is freed or replaced.
+   */
+  async function watch(id: string, node: WasmNode) {
+    do {
+      refresh(id)
+      // Links close with their endpoints' interfaces, so bus membership
+      // changes along with some node's state.
+      for (const busId of busHandles.keys()) refreshBus(busId)
+    } while ((await node.waitStatusChange()) && nodeHandles.get(id) === node)
   }
 
   function refreshBus(id: string) {
@@ -142,7 +151,7 @@ export const useTopologyStore = defineStore('topology', () => {
     // Every node answers pings and listens to the sensor topic.
     void node.servePing()
     void node.subscribeSensor()
-    refresh(id)
+    void watch(id, node)
   }
 
   function createBus(id: string) {
@@ -236,16 +245,11 @@ export const useTopologyStore = defineStore('topology', () => {
     }
     linkHandles.set(edgeId, link)
     linkEndpoints.set(edgeId, { sourceId, targetId, busId })
-    // Warm the link with one ping so the child learns its address. Pending
-    // bridge downlinks (netId 0) warm themselves after seed assignment.
+    // Warm the link with one ping so the child learns its address before
+    // its first heartbeat. Pending bridge downlinks (netId 0) warm themselves
+    // after seed assignment.
     if (!busId && source && target && link.netId > 0) {
-      void source
-        .ping(link.netId, 2, 500)
-        .catch(() => {})
-        .then(() => {
-          refresh(sourceId)
-          refresh(targetId)
-        })
+      void source.ping(link.netId, 2, 500).catch(() => {})
     }
     refresh(sourceId)
     refresh(targetId)
@@ -376,6 +380,5 @@ export const useTopologyStore = defineStore('topology', () => {
     setLinkKind,
     ping,
     refresh,
-    refreshAll,
   }
 })
