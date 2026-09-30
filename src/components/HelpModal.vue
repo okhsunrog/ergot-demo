@@ -28,11 +28,14 @@ const open = defineModel<boolean>('open', { required: true })
           </li>
           <li>
             <b>Break a link:</b> select a link, set <b>loss</b> to 100 — that node's sparkline
-            starves while its siblings keep flowing. Set <b>lat</b> to 200 and ping through it.
+            starves while its siblings keep flowing. After three missed heartbeats (about 3 s) the
+            parent drops the link's net and the child falls back to link-local; set loss back to 0
+            and the next heartbeat heals it. Set <b>lat</b> to 200 and ping through it.
           </li>
           <li>
             <b>Inspect frames:</b> the <b>Frames</b> panel lists every frame on the wire —
-            addresses, kind, sequence numbers.
+            addresses, kind, traffic class. Each point-to-point link carries a heartbeat request and
+            reply every second.
           </li>
           <li>
             <b>Rewire:</b> drag from a router's bottom handle to a node's top handle. Uplinked nodes

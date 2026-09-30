@@ -4,10 +4,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
+use ergot::exports::maitake_sync::WaitQueue;
 use ergot::time::Duration;
 use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use futures_core::Stream;
-use maitake_sync::WaitQueue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::duplex;

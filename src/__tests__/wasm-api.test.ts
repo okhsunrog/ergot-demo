@@ -283,7 +283,7 @@ test('frame tap records labelled request and response frames', async () => {
   const onLink = events.filter((e) => e.linkId === 'edge-42')
   expect(onLink.some((e) => e.dir === 'down' && e.kind === 'req')).toBe(true)
   expect(onLink.some((e) => e.dir === 'up' && e.kind === 'resp')).toBe(true)
-  const req = onLink.find((e) => e.kind === 'req')
+  const req = onLink.find((e) => e.dir === 'down' && e.kind === 'req')
   expect(req?.dst).toBe(`${link.netId}.2:0`)
 
   // After disconnect the tap label is cleared: no more events for this link.
@@ -707,3 +707,57 @@ test('bridge: connection validation', () => {
   link.free()
   for (const n of [root, bridge, root2]) n.free()
 })
+
+function routerNets(node: WasmNode) {
+  const status = node.status()
+  if (status.profile !== 'router') throw new Error('expected a router node')
+  return status.nets
+}
+
+for (const [name, kind] of [
+  ['packet', LinkKind.Packet],
+  ['stream', LinkKind.Stream],
+] as const) {
+  test(`liveness (${name}): a silent link drops both ends, heartbeats heal it`, async () => {
+    const router = new WasmNode(NodeProfile.Router)
+    const edge = new WasmNode(NodeProfile.Edge, kind)
+    const link = router.connectTo(edge)
+    // No ping servers: the heartbeat alone teaches the edge its net.
+    await waitFor(() => edgeStatus(edge).netId === link.netId)
+
+    // Three missed heartbeats: the router's downlink goes Inactive and the
+    // edge falls back to link-local, still active so it can keep beating.
+    link.setImpairment(0, 100)
+    await waitFor(() => routerNets(router).length === 0 && edgeStatus(edge).netId === 0, 6_000)
+    expect(edgeStatus(edge).status).toBe('active')
+
+    link.setImpairment(0, 0)
+    await waitFor(
+      () => routerNets(router).includes(link.netId) && edgeStatus(edge).netId === link.netId,
+      4_000,
+    )
+
+    link.free()
+    edge.free()
+    router.free()
+  }, 15_000)
+}
+
+test('liveness: a quiet shared bus stays up', async () => {
+  const router = new WasmNode(NodeProfile.Router)
+  const a = new WasmNode(NodeProfile.Edge, LinkKind.Packet)
+  const bus = new WasmBus()
+  const routerLink = bus.attachRouter(router, 'bus-router')
+  const linkA = bus.attachEdge(a, 'bus-a')
+  await waitFor(() => (edgeStatus(a).netId ?? 0) > 0)
+
+  // Bus members only talk on lease refreshes; silence must not drop them.
+  await sleep(4_000)
+  expect(routerNets(router)).toEqual([routerLink.netId])
+  expect(edgeStatus(a).netId).toBe(routerLink.netId)
+
+  linkA.free()
+  routerLink.free()
+  bus.free()
+  for (const node of [router, a]) node.free()
+}, 10_000)

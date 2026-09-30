@@ -4,8 +4,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
+use ergot::exports::bbqueue::traits::{bbqhdl::BbqHandle, notifier::AsyncNotifier};
+use ergot::exports::maitake_sync::WaitQueue;
 use ergot::interface_manager::{
-    FrameProcessor, InterfaceState, Profile,
+    FrameProcessor, InterfaceState, LivenessConfig, Profile,
     profiles::{
         direct_edge::EdgeFrameProcessor,
         router::{RouterFrameProcessor, UPSTREAM_IDENT},
@@ -16,15 +18,15 @@ use ergot::interface_manager::{
     },
     utils::std::StdQueue,
 };
+use ergot::net_stack::NetStackHandle;
 use ergot::wire_frames::de_frame;
 use futures_channel::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use futures_core::Stream;
-use maitake_sync::WaitQueue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::duplex;
 
-use super::{BUF_SIZE, EdgeStack, Impairment, RouterStack};
+use super::{BUF_SIZE, EdgeStack, Impairment, LIVENESS_TIMEOUT, RouterStack};
 
 #[derive(Debug)]
 pub(super) struct LinkClosed;
@@ -86,6 +88,8 @@ pub(super) fn router_tx_half(tx: MpscSender<Vec<u8>>, impairment: &Impairment) -
 pub(super) enum StackSide {
     /// Parent downlink on a router-profile stack (router or bridge).
     RouterDown(RouterStack, u8, u16),
+    /// A root router's interface on a shared bus.
+    BusRouter(RouterStack, u8, u16),
     /// Bridge uplink (UPSTREAM_IDENT, edge-style frame processing).
     BridgeUp(RouterStack),
     /// Edge uplink.
@@ -93,6 +97,78 @@ pub(super) enum StackSide {
     /// Edge attached to a shared bus. Frames for other bus members must be
     /// rejected before they reach the point-to-point DirectEdge processor.
     BusEdge(EdgeStack),
+}
+
+/// How one end of a link reacts when its peer goes quiet.
+#[derive(Clone, Copy)]
+enum Liveness {
+    /// Bus members stay quiet between lease refreshes, so silence on a bus
+    /// means nothing.
+    Off,
+    /// A downlink goes Inactive; the child's next heartbeat brings it back.
+    Downstream,
+    /// An uplink reverts to link-local rather than Inactive, so it can keep
+    /// sending the heartbeat that provokes its recovery.
+    Upstream,
+}
+
+impl StackSide {
+    fn liveness(&self) -> Liveness {
+        match self {
+            StackSide::RouterDown(..) => Liveness::Downstream,
+            StackSide::BridgeUp(_) | StackSide::Edge(_) => Liveness::Upstream,
+            StackSide::BusRouter(..) | StackSide::BusEdge(_) => Liveness::Off,
+        }
+    }
+}
+
+const LIVENESS: LivenessConfig = LivenessConfig {
+    timeout_ms: LIVENESS_TIMEOUT.as_millis() as u64,
+};
+
+/// Run a stream receive worker under `liveness` until the link closes.
+async fn run_stream_rx<N, R, P>(
+    worker: RxWorker<N, R, P>,
+    liveness: Liveness,
+    frame: &mut [u8],
+    scratch: &mut [u8],
+) where
+    N: NetStackHandle,
+    R: futures_io::AsyncRead + Unpin,
+    P: FrameProcessor<N>,
+{
+    let mut worker = match liveness {
+        Liveness::Upstream => worker.revert_to_link_local_on_timeout(),
+        Liveness::Off | Liveness::Downstream => worker,
+    };
+    let _ = match liveness {
+        Liveness::Off => worker.run(frame, scratch).await,
+        Liveness::Downstream | Liveness::Upstream => {
+            worker.run_with_liveness(frame, scratch, LIVENESS).await
+        }
+    };
+}
+
+/// Apply `liveness` to a packet worker.
+fn packet_liveness<N, Rx, Tx, Q, P>(
+    worker: PacketRxTxWorker<N, Rx, Tx, Q, P>,
+    liveness: Liveness,
+) -> PacketRxTxWorker<N, Rx, Tx, Q, P>
+where
+    N: NetStackHandle,
+    Rx: PacketReceiver,
+    Tx: PacketSender,
+    Q: BbqHandle,
+    Q::Notifier: AsyncNotifier,
+    P: FrameProcessor<N>,
+{
+    match liveness {
+        Liveness::Off => worker,
+        Liveness::Downstream => worker.with_liveness(LIVENESS),
+        Liveness::Upstream => worker
+            .with_liveness(LIVENESS)
+            .revert_to_link_local_on_timeout(),
+    }
 }
 
 struct BusEdgeFrameProcessor {
@@ -131,42 +207,45 @@ impl FrameProcessor<EdgeStack> for BusEdgeFrameProcessor {
 }
 
 pub(super) fn spawn_stream_rx(side: StackSide, reader: duplex::PipeReader, closer: Arc<WaitQueue>) {
+    let liveness = side.liveness();
     spawn_local(async move {
         let mut frame = vec![0u8; BUF_SIZE];
         let mut scratch = vec![0u8; BUF_SIZE];
+        let (frame, scratch) = (&mut frame[..], &mut scratch[..]);
         match side {
-            StackSide::RouterDown(stack, ident, net_id) => {
-                let mut rx_worker = RxWorker::new(
+            StackSide::RouterDown(stack, ident, net_id)
+            | StackSide::BusRouter(stack, ident, net_id) => {
+                let rx_worker = RxWorker::new(
                     stack.clone(),
                     reader,
                     RouterFrameProcessor::new(net_id),
                     ident,
                 )
                 .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                // Consumes the worker, which sets the interface Down on drop.
+                run_stream_rx(rx_worker, liveness, frame, scratch).await;
                 closer.close();
-                drop(rx_worker);
                 stack.manage_profile(|im| {
                     let _ = im.deregister_interface(ident);
                 });
             }
             StackSide::BridgeUp(stack) => {
-                let mut rx_worker =
+                let rx_worker =
                     RxWorker::new(stack, reader, EdgeFrameProcessor::new(), UPSTREAM_IDENT)
                         .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                run_stream_rx(rx_worker, liveness, frame, scratch).await;
                 closer.close();
             }
             StackSide::Edge(stack) => {
-                let mut rx_worker = RxWorker::new(stack, reader, EdgeFrameProcessor::new(), ())
+                let rx_worker = RxWorker::new(stack, reader, EdgeFrameProcessor::new(), ())
                     .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                run_stream_rx(rx_worker, liveness, frame, scratch).await;
                 closer.close();
             }
             StackSide::BusEdge(stack) => {
-                let mut rx_worker = RxWorker::new(stack, reader, BusEdgeFrameProcessor::new(), ())
+                let rx_worker = RxWorker::new(stack, reader, BusEdgeFrameProcessor::new(), ())
                     .with_closer(closer.clone());
-                let _ = rx_worker.run(&mut frame, &mut scratch).await;
+                run_stream_rx(rx_worker, liveness, frame, scratch).await;
                 closer.close();
             }
         }
@@ -196,18 +275,23 @@ pub(super) fn spawn_packet_worker<T>(
         rx,
         closer: closer.clone(),
     };
+    let liveness = side.liveness();
     spawn_local(async move {
         let consumer = queue.framed_consumer();
         let mut scratch = vec![0u8; BUF_SIZE];
         match side {
-            StackSide::RouterDown(stack, ident, net_id) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack.clone(),
-                    receiver,
-                    tx,
-                    RouterFrameProcessor::new(net_id),
-                    ident,
-                    consumer,
+            StackSide::RouterDown(stack, ident, net_id)
+            | StackSide::BusRouter(stack, ident, net_id) => {
+                let mut worker = packet_liveness(
+                    PacketRxTxWorker::new(
+                        stack.clone(),
+                        receiver,
+                        tx,
+                        RouterFrameProcessor::new(net_id),
+                        ident,
+                        consumer,
+                    ),
+                    liveness,
                 );
                 let _ = worker.run(initial_state, &mut scratch).await;
                 closer.close();
@@ -217,37 +301,46 @@ pub(super) fn spawn_packet_worker<T>(
                 });
             }
             StackSide::BridgeUp(stack) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack,
-                    receiver,
-                    tx,
-                    EdgeFrameProcessor::new(),
-                    UPSTREAM_IDENT,
-                    consumer,
+                let mut worker = packet_liveness(
+                    PacketRxTxWorker::new(
+                        stack,
+                        receiver,
+                        tx,
+                        EdgeFrameProcessor::new(),
+                        UPSTREAM_IDENT,
+                        consumer,
+                    ),
+                    liveness,
                 );
                 let _ = worker.run(initial_state, &mut scratch).await;
                 closer.close();
             }
             StackSide::Edge(stack) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack,
-                    receiver,
-                    tx,
-                    EdgeFrameProcessor::new(),
-                    (),
-                    consumer,
+                let mut worker = packet_liveness(
+                    PacketRxTxWorker::new(
+                        stack,
+                        receiver,
+                        tx,
+                        EdgeFrameProcessor::new(),
+                        (),
+                        consumer,
+                    ),
+                    liveness,
                 );
                 let _ = worker.run(initial_state, &mut scratch).await;
                 closer.close();
             }
             StackSide::BusEdge(stack) => {
-                let mut worker = PacketRxTxWorker::new(
-                    stack,
-                    receiver,
-                    tx,
-                    BusEdgeFrameProcessor::new(),
-                    (),
-                    consumer,
+                let mut worker = packet_liveness(
+                    PacketRxTxWorker::new(
+                        stack,
+                        receiver,
+                        tx,
+                        BusEdgeFrameProcessor::new(),
+                        (),
+                        consumer,
+                    ),
+                    liveness,
                 );
                 let _ = worker.run(initial_state, &mut scratch).await;
                 closer.close();

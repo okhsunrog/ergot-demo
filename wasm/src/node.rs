@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
 use futures_channel::mpsc::channel;
-use maitake_sync::WaitQueue;
 use serde::Serialize;
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
@@ -35,10 +34,11 @@ use wasm_bindgen_futures::spawn_local;
 
 use ergot::{
     Address,
+    exports::{maitake_sync::WaitQueue, mutex::raw_impls::cs::CriticalSectionRawMutex},
     interface_manager::{
         InterfaceState, Profile,
         profiles::{
-            direct_edge::{DirectEdge, EDGE_NODE_ID},
+            direct_edge::{CENTRAL_NODE_ID, DirectEdge, EDGE_NODE_ID},
             router::{Router, UPSTREAM_IDENT},
         },
         utils::std::{StdQueue, new_std_queue},
@@ -47,7 +47,6 @@ use ergot::{
     time::{Duration, Instant, TimedOut, sleep, with_timeout},
     well_known::ErgotPingEndpoint,
 };
-use mutex::raw_impls::cs::CriticalSectionRawMutex;
 
 use crate::duplex;
 
@@ -67,6 +66,16 @@ use transport::{StackSide, router_tx_half, spawn_packet_worker, spawn_stream_rx,
 // The demo's sensor stream: a plain f32 reading, fire-and-forget.
 ergot::topic!(SensorTopic, f32, "ergot-demo/sensor");
 
+// A child's link heartbeat. Every router-profile node answers it, so a link's
+// liveness never depends on whether the user attached a ping server.
+ergot::endpoint!(
+    HeartbeatEndpoint,
+    (),
+    (),
+    "ergot-demo/heartbeat",
+    class = ergot::TrafficClass::Control
+);
+
 const MTU: u16 = 512;
 const MAX_SAMPLES: usize = 64;
 const QUEUE_SIZE: usize = 4096;
@@ -76,6 +85,11 @@ const MAX_SEEDS: usize = 16;
 const MAX_CLAIMS: usize = 64;
 const PACKET_QUEUE_FRAMES: usize = 16;
 const MAX_LATENCY_MS: u32 = 60_000;
+/// How often a child pings its parent over a point-to-point link.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+/// Silence after which either end of a link treats its peer as gone: three
+/// missed heartbeats.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Wait `duration`; true means `closer` fired first and the task should end.
 async fn closed_within(closer: &WaitQueue, duration: Duration) -> bool {
@@ -83,6 +97,44 @@ async fn closed_within(closer: &WaitQueue, duration: Duration) -> bool {
         select(sleep(duration), closer.wait()).await,
         Either::Second(_)
     )
+}
+
+/// Keep a point-to-point link's liveness fed from the child side: ping the
+/// parent link-locally every [`HEARTBEAT`] until the link closes. The request
+/// and its reply are the frames both ends' liveness timers wait for, and after
+/// a timeout the reply is what lets the child re-discover its net id.
+fn spawn_heartbeat<P>(stack: ArcNetStack<CriticalSectionRawMutex, P>, closer: Arc<WaitQueue>)
+where
+    P: Profile + 'static,
+{
+    const PARENT: Address = Address {
+        network_id: 0,
+        node_id: CENTRAL_NODE_ID,
+        port_id: 0,
+    };
+    spawn_local(async move {
+        while !closed_within(&closer, HEARTBEAT).await {
+            let beat =
+                stack
+                    .endpoints()
+                    .request::<HeartbeatEndpoint>(PARENT, &(), Some("heartbeat"));
+            // Neither an unanswered nor a refused beat (the uplink not yet up)
+            // needs handling: the next one simply tries again.
+            let _ = select(with_timeout(HEARTBEAT, beat), closer.wait()).await;
+        }
+    });
+}
+
+/// Answer the heartbeats of every child linked below this node.
+async fn serve_heartbeats(stack: RouterStack) {
+    let server = stack
+        .endpoints()
+        .bounded_server::<HeartbeatEndpoint, 4>(Some("heartbeat"));
+    let server = pin!(server);
+    let mut hdl = server.attach();
+    loop {
+        let _ = hdl.serve(|_: &()| async {}).await;
+    }
 }
 
 fn fmt_addr(a: &Address) -> String {
@@ -316,16 +368,21 @@ impl WasmNode {
             }
         };
         // Router-profile nodes answer seed-router assignment requests from
-        // bridges below them.
+        // bridges below them, and the link heartbeats of all their children.
         if let Stack::Router(stack) | Stack::Bridge { stack, .. } = &stack {
-            let stack = stack.clone();
+            let seed_stack = stack.clone();
             let closer = services_closer.clone();
             spawn_local(async move {
                 let _ = select(
-                    stack.services().seed_router_request_handler::<4>(),
+                    seed_stack.services().seed_router_request_handler::<4>(),
                     closer.wait(),
                 )
                 .await;
+            });
+            let heartbeat_stack = stack.clone();
+            let closer = services_closer.clone();
+            spawn_local(async move {
+                let _ = select(serve_heartbeats(heartbeat_stack), closer.wait()).await;
             });
         }
         // Root routers also lease unique node_ids to devices sharing one bus
@@ -599,6 +656,12 @@ impl WasmNode {
         // so the child learns its address.
         if parent_is_bridge {
             spawn_seed_assign(parent.clone(), ident, closer.clone());
+        }
+
+        match &target.stack {
+            Stack::Edge { stack, .. } => spawn_heartbeat(stack.clone(), closer.clone()),
+            Stack::Bridge { stack, .. } => spawn_heartbeat(stack.clone(), closer.clone()),
+            Stack::Router(_) => unreachable!("validated above"),
         }
 
         let state = Rc::new(LinkState {

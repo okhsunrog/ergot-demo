@@ -9,12 +9,12 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use embassy_futures::select::{Either, select};
+use ergot::exports::maitake_sync::WaitQueue;
 use ergot::interface_manager::transports::packet::PacketSender;
 use ergot::interface_manager::{InterfaceState, Profile};
 use ergot::net_stack::services::{bus_claim_refresh, bus_claim_with_retry};
 use ergot::time::{Duration, TimedOut, with_timeout};
 use futures_channel::mpsc::{Sender as MpscSender, channel};
-use maitake_sync::WaitQueue;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
@@ -203,7 +203,7 @@ impl WasmBus {
             closer: closer.clone(),
         };
         spawn_packet_worker(
-            StackSide::RouterDown(stack.clone(), ident, net_id),
+            StackSide::BusRouter(stack.clone(), ident, net_id),
             rx,
             tx,
             queue,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ergot::{
     Address,
+    exports::maitake_sync::WaitQueue,
     interface_manager::{
         InterfaceState, Profile,
         profiles::{direct_edge::EDGE_NODE_ID, router::UPSTREAM_IDENT},
@@ -10,7 +11,6 @@ use ergot::{
     time::{Duration, with_timeout},
     well_known::ErgotPingEndpoint,
 };
-use maitake_sync::WaitQueue;
 use wasm_bindgen_futures::spawn_local;
 
 use super::{RouterStack, closed_within};
@@ -32,10 +32,13 @@ pub(super) fn spawn_seed_assign(stack: RouterStack, ident: u8, closer: Arc<WaitQ
                 if closed_within(&closer, retry).await {
                     return;
                 }
+                // Link-local (net 0) is not enough: it is how the uplink
+                // starts over after a liveness timeout, before it knows its
+                // net again.
                 let upstream_active = stack.manage_profile(|im| {
                     matches!(
                         im.interface_state(UPSTREAM_IDENT),
-                        Some(InterfaceState::Active { .. })
+                        Some(InterfaceState::Active { net_id, .. }) if net_id != 0
                     )
                 });
                 if !upstream_active {

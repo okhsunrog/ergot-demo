@@ -80,10 +80,17 @@ const addressLabel = computed(() => {
     return s.nets.length ? `nets ${s.nets.join(', ')}` : 'no links'
   }
   if (s.profile === 'bridge') {
-    const up = s.upstream === 'active' && s.upstreamNetId ? `up ${s.upstreamNetId}.2` : 'no uplink'
+    const up =
+      s.upstream !== 'active'
+        ? 'no uplink'
+        : s.upstreamNetId
+          ? `up ${s.upstreamNetId}.2`
+          : 'uplink link-local'
     return s.nets.length ? `${up} · nets ${s.nets.join(', ')}` : up
   }
-  if (s.status === 'active' && s.netId) return `${s.netId}.${s.nodeId}`
+  // Active on net 0: connected but not (or no longer) addressed, e.g. right
+  // after connect or after a liveness timeout.
+  if (s.status === 'active') return s.netId ? `${s.netId}.${s.nodeId}` : 'link-local'
   return s.status
 })
 
